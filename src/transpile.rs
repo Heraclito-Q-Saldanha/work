@@ -63,8 +63,13 @@ pub fn transpile_project(root: &Path, dest: &Path, glue_name: &str) -> Result<Ve
                     write_rs(&file, &code)?;
                 }
                 fs::remove_file(&file)?;
-                let html =
-                    loader::render_page(&template.html, &path, glue_name, main_fn.as_deref(), has_regions);
+                let html = loader::render_page(
+                    &template.html,
+                    &path,
+                    glue_name,
+                    main_fn.as_deref(),
+                    has_regions,
+                );
                 pages.push(Page { path, html });
             }
             FileKind::RustOnly => rust_only.push(file),
@@ -74,7 +79,8 @@ pub fn transpile_project(root: &Path, dest: &Path, glue_name: &str) -> Result<Ve
 
     // Os `.wk.rs` não têm HTML próprio: expõem as funções chamadas por qualquer página.
     for file in rust_only {
-        let code = fs::read_to_string(&file).with_context(|| format!("lendo {}", file.display()))?;
+        let code =
+            fs::read_to_string(&file).with_context(|| format!("lendo {}", file.display()))?;
         let code =
             rust::transform(&code, &handlers).with_context(|| format!("em {}", file.display()))?;
         write_rs(&file, &code)?;
@@ -106,7 +112,10 @@ enum FileKind {
 
 impl FileKind {
     fn of(path: &Path) -> Self {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if name.ends_with(".wk.rs") {
             Self::RustOnly
         } else if name.ends_with(".wk") {

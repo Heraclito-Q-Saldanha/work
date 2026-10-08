@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
-use std::collections::BTreeSet;
 use proc_macro2::LineColumn;
+use std::collections::BTreeSet;
 use syn::{Item, spanned::Spanned};
 
 pub const WASM_BINDGEN_ATTR: &str = "#[::wasm_bindgen::prelude::wasm_bindgen]";
@@ -53,7 +53,11 @@ fn collect_edits(items: &[Item], names: &BTreeSet<String>, offsets: &Offsets) ->
                 edits.push((at, at, format!("{WASM_BINDGEN_ATTR}\n")));
                 if let Some(name) = &m.abi.name {
                     let lit = name.span();
-                    edits.push((offsets.of(lit.start()), offsets.of(lit.end()), "\"C\"".into()));
+                    edits.push((
+                        offsets.of(lit.start()),
+                        offsets.of(lit.end()),
+                        "\"C\"".into(),
+                    ));
                 }
             }
             _ => {}
@@ -82,7 +86,9 @@ mod tests {
         let out = transform(code, &names).unwrap();
         assert_eq!(
             out,
-            format!("fn other() {{}}\n\n{WASM_BINDGEN_ATTR} /// doc\npub fn add(a: i32) -> i32 {{ a }}\n")
+            format!(
+                "fn other() {{}}\n\n{WASM_BINDGEN_ATTR} /// doc\npub fn add(a: i32) -> i32 {{ a }}\n"
+            )
         );
         syn::parse_file(&out).unwrap();
     }
@@ -93,7 +99,9 @@ mod tests {
         let out = transform(code, &BTreeSet::new()).unwrap();
         assert_eq!(
             out,
-            format!("{WASM_BINDGEN_ATTR}\nextern \"C\" {{\n    fn alert(s: &str);\n}}\nextern \"C\" {{}}\n")
+            format!(
+                "{WASM_BINDGEN_ATTR}\nextern \"C\" {{\n    fn alert(s: &str);\n}}\nextern \"C\" {{}}\n"
+            )
         );
     }
 }

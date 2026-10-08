@@ -48,11 +48,15 @@ fn build() -> Result<()> {
     let name = manifest::lib_name(&root)?;
     let pages = transpile::transpile_project(&root, tmp.path(), &name)?;
     manifest::ensure_wasm_bindgen(tmp.path())?;
-    let wasm = builder::compile_wasm(tmp.path(), &root.join("target/wk"))
-        .context("compilando projeto")?;
+    let wasm =
+        builder::compile_wasm(tmp.path(), &root.join("target/wk")).context("compilando projeto")?;
 
     let dist = root.join("dist");
     builder::package(&dist, &wasm, &pages)?;
-    println!("{} página(s) HTML + wasm em {}", pages.len(), dist.display());
+    println!(
+        "{} página(s) HTML + wasm em {}",
+        pages.len(),
+        dist.display()
+    );
     Ok(())
 }

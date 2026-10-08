@@ -20,7 +20,9 @@ pub fn parse(source: &str) -> Result<ParsedWk> {
             .append_element_content_handler(element!("*", |el| {
                 for attr in el.attributes() {
                     if attr.name().starts_with("on") {
-                        handlers.borrow_mut().extend(called_functions(&attr.value()));
+                        handlers
+                            .borrow_mut()
+                            .extend(called_functions(&attr.value()));
                     }
                 }
                 Ok(())
@@ -41,7 +43,11 @@ pub fn parse(source: &str) -> Result<ParsedWk> {
 
     let scripts = scripts.into_inner();
     let rust = (!scripts.is_empty()).then(|| scripts.join("\n"));
-    Ok(ParsedWk { html, rust, handlers: handlers.into_inner() })
+    Ok(ParsedWk {
+        html,
+        rust,
+        handlers: handlers.into_inner(),
+    })
 }
 
 /// Identificadores usados como chamada de função (`nome(`) em um trecho de JS,

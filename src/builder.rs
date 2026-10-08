@@ -18,7 +18,11 @@ const TARGET: &str = "wasm32-unknown-unknown";
 pub fn compile_wasm(project: &Path, target_dir: &Path) -> Result<PathBuf> {
     let mut child = Command::new("cargo")
         .args(["rustc", "--release", "--lib", "--target", TARGET])
-        .args(["--message-format=json-render-diagnostics", "--crate-type", "cdylib"])
+        .args([
+            "--message-format=json-render-diagnostics",
+            "--crate-type",
+            "cdylib",
+        ])
         .env("CARGO_TARGET_DIR", target_dir)
         .current_dir(project)
         .stdout(Stdio::piped())
@@ -40,7 +44,9 @@ pub fn compile_wasm(project: &Path, target_dir: &Path) -> Result<PathBuf> {
     }
 
     if !child.wait()?.success() {
-        bail!("cargo build falhou (o target {TARGET} está instalado? `rustup target add {TARGET}`)");
+        bail!(
+            "cargo build falhou (o target {TARGET} está instalado? `rustup target add {TARGET}`)"
+        );
     }
     wasm.context("cargo não produziu um .wasm (o projeto precisa de um src/lib.rs)")
 }

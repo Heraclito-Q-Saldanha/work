@@ -35,15 +35,27 @@ enum Tok {
     ElseIf(String),
     Else,
     EndIf,
-    Each { iter: String, pat: String, index: Option<String> },
+    Each {
+        iter: String,
+        pat: String,
+        index: Option<String>,
+    },
     EndEach,
 }
 
 enum Node {
     Raw(String),
     Interp(Expr),
-    If { branches: Vec<(Expr, Vec<Node>)>, otherwise: Option<Vec<Node>> },
-    Each { iter: Expr, pat: Pat, index: Option<Pat>, body: Vec<Node> },
+    If {
+        branches: Vec<(Expr, Vec<Node>)>,
+        otherwise: Option<Vec<Node>>,
+    },
+    Each {
+        iter: Expr,
+        pat: Pat,
+        index: Option<Pat>,
+        body: Vec<Node>,
+    },
 }
 
 pub fn compile(html: &str) -> Result<Template> {
@@ -98,7 +110,13 @@ struct Lexer {
 }
 
 fn tokenize(src: &str) -> Result<Vec<Tok>> {
-    let mut lx = Lexer { chars: src.chars().collect(), pos: 0, raw: String::new(), toks: vec![], depth: 0 };
+    let mut lx = Lexer {
+        chars: src.chars().collect(),
+        pos: 0,
+        raw: String::new(),
+        toks: vec![],
+        depth: 0,
+    };
     let mut in_tag = false;
     let mut quote_char: Option<char> = None;
     let mut raw_text_element: Option<String> = None;
@@ -123,7 +141,12 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                         raw_text_element = Some(name);
                     }
                     in_tag = true;
-                } else if next == '/' && lx.chars.get(lx.pos + 2).is_some_and(|c| c.is_ascii_alphabetic()) {
+                } else if next == '/'
+                    && lx
+                        .chars
+                        .get(lx.pos + 2)
+                        .is_some_and(|c| c.is_ascii_alphabetic())
+                {
                     in_tag = true;
                 }
             }
@@ -169,7 +192,9 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
 
 impl Lexer {
     fn starts_with(&self, s: &str) -> bool {
-        s.chars().enumerate().all(|(i, c)| self.chars.get(self.pos + i) == Some(&c))
+        s.chars()
+            .enumerate()
+            .all(|(i, c)| self.chars.get(self.pos + i) == Some(&c))
     }
 
     fn flush(&mut self) {
@@ -197,7 +222,9 @@ impl Lexer {
         let close: Vec<char> = format!("</{name}").chars().collect();
         while self.pos < self.chars.len() {
             let matches = close.iter().enumerate().all(|(i, c)| {
-                self.chars.get(self.pos + i).is_some_and(|x| x.to_ascii_lowercase() == *c)
+                self.chars
+                    .get(self.pos + i)
+                    .is_some_and(|x| x.to_ascii_lowercase() == *c)
             });
             if matches {
                 return;
@@ -237,7 +264,10 @@ impl Lexer {
         match tok {
             Tok::If(_) | Tok::Each { .. } => self.depth += 1,
             Tok::EndIf | Tok::EndEach => {
-                self.depth = self.depth.checked_sub(1).ok_or_else(|| anyhow!("`{{{inner}}}` sem bloco aberto"))?;
+                self.depth = self
+                    .depth
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow!("`{{{inner}}}` sem bloco aberto"))?;
             }
             _ => {}
         }
@@ -271,7 +301,11 @@ impl Lexer {
                     }
                 }
                 '\'' if self.chars.get(i + 2) == Some(&'\'') => i += 2,
-                '\'' if self.chars.get(i + 1) == Some(&'\\') && self.chars.get(i + 3) == Some(&'\'') => i += 3,
+                '\'' if self.chars.get(i + 1) == Some(&'\\')
+                    && self.chars.get(i + 3) == Some(&'\'') =>
+                {
+                    i += 3
+                }
                 _ => {}
             }
             i += 1;
@@ -399,7 +433,10 @@ fn parse_if(toks: &mut Toks, cond: String) -> Result<Node> {
             _ => bail!("`{{#if}}` sem `{{/if}}`"),
         }
     }
-    Ok(Node::If { branches, otherwise })
+    Ok(Node::If {
+        branches,
+        otherwise,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -452,14 +489,23 @@ mod tests {
 
     #[test]
     fn static_html_is_untouched() {
-        let t = compile("<p>oi</p><script>if (a) { b(); }</script><style>p { color: red }</style><!-- {x} -->").unwrap();
-        assert_eq!(t.html, "<p>oi</p><script>if (a) { b(); }</script><style>p { color: red }</style><!-- {x} -->");
+        let t = compile(
+            "<p>oi</p><script>if (a) { b(); }</script><style>p { color: red }</style><!-- {x} -->",
+        )
+        .unwrap();
+        assert_eq!(
+            t.html,
+            "<p>oi</p><script>if (a) { b(); }</script><style>p { color: red }</style><!-- {x} -->"
+        );
         assert!(t.regions.is_empty());
     }
 
     #[test]
     fn creates_regions_with_anchors() {
-        let t = compile("<p>{a}</p>{#if a > 1}x{:else}y{/if}<ul>{#each v as it, i}<li>{i}{it}</li>{/each}</ul>").unwrap();
+        let t = compile(
+            "<p>{a}</p>{#if a > 1}x{:else}y{/if}<ul>{#each v as it, i}<li>{i}{it}</li>{/each}</ul>",
+        )
+        .unwrap();
         assert_eq!(t.regions.len(), 3);
         assert_eq!(
             t.html,

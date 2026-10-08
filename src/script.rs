@@ -164,7 +164,8 @@ pub fn transform(
                     exported.push(f);
                 } else {
                     let mut f = f;
-                    f.attrs.push(parse_quote!(#[::wasm_bindgen::prelude::wasm_bindgen]));
+                    f.attrs
+                        .push(parse_quote!(#[::wasm_bindgen::prelude::wasm_bindgen]));
                     hoisted.push(Item::Fn(f));
                 }
             }
@@ -238,7 +239,11 @@ pub fn transform(
 
     // Cada função e região é registrada logo após a última variável compartilhada que usa.
     let after_decls = |used: &BTreeSet<String>| {
-        used.iter().filter_map(|v| decl_end.get(v)).max().copied().unwrap_or(0)
+        used.iter()
+            .filter_map(|v| decl_end.get(v))
+            .max()
+            .copied()
+            .unwrap_or(0)
     };
     let mut registrations: Vec<(usize, Stmt)> = Vec::new();
     let mut statics: Vec<TokenStream> = Vec::new();
@@ -269,8 +274,16 @@ pub fn transform(
 
     let main_ident = format_ident!("{main_name}");
     let attr: TokenStream = WASM_BINDGEN_ATTR.parse().unwrap();
-    let state: TokenStream = if has_state { RUNTIME_STATE.parse().unwrap() } else { quote!() };
-    let region_rt: TokenStream = if regions.is_empty() { quote!() } else { RUNTIME_REGIONS.parse().unwrap() };
+    let state: TokenStream = if has_state {
+        RUNTIME_STATE.parse().unwrap()
+    } else {
+        quote!()
+    };
+    let region_rt: TokenStream = if regions.is_empty() {
+        quote!()
+    } else {
+        RUNTIME_REGIONS.parse().unwrap()
+    };
     let tokens = quote! {
         #state
         #region_rt
@@ -371,7 +384,11 @@ fn ident_of(pat: &Pat) -> syn::Ident {
 }
 
 /// Devolve (registro da closure, `thread_local!` que a guarda, wrapper exportado).
-fn closure_parts(f: &ItemFn, used: &BTreeSet<String>, flush: bool) -> (Stmt, TokenStream, TokenStream) {
+fn closure_parts(
+    f: &ItemFn,
+    used: &BTreeSet<String>,
+    flush: bool,
+) -> (Stmt, TokenStream, TokenStream) {
     let name = &f.sig.ident;
     let storage = format_ident!("__WK_FN_{}", name.to_string().to_uppercase());
     let attrs = &f.attrs;
@@ -396,7 +413,11 @@ fn closure_parts(f: &ItemFn, used: &BTreeSet<String>, flush: bool) -> (Stmt, Tok
     });
     let missing = format!("`{name}` chamada antes do script da página terminar de carregar");
     let attr: TokenStream = WASM_BINDGEN_ATTR.parse().unwrap();
-    let flush = if flush { quote!(__wk_flush();) } else { quote!() };
+    let flush = if flush {
+        quote!(__wk_flush();)
+    } else {
+        quote!()
+    };
 
     let registration = parse_quote!({
         #(#clones)*
@@ -448,8 +469,16 @@ fn is_compound_assign(op: &syn::BinOp) -> bool {
     use syn::BinOp::*;
     matches!(
         op,
-        AddAssign(_) | SubAssign(_) | MulAssign(_) | DivAssign(_) | RemAssign(_)
-            | BitXorAssign(_) | BitAndAssign(_) | BitOrAssign(_) | ShlAssign(_) | ShrAssign(_)
+        AddAssign(_)
+            | SubAssign(_)
+            | MulAssign(_)
+            | DivAssign(_)
+            | RemAssign(_)
+            | BitXorAssign(_)
+            | BitAndAssign(_)
+            | BitOrAssign(_)
+            | ShlAssign(_)
+            | ShrAssign(_)
     )
 }
 
@@ -485,7 +514,11 @@ fn inline_format_args(s: &str) -> Vec<String> {
 
 impl Rewriter {
     fn new(active: BTreeSet<String>) -> Self {
-        Self { active, used: BTreeSet::new(), mutable: false }
+        Self {
+            active,
+            used: BTreeSet::new(),
+            mutable: false,
+        }
     }
 
     fn scoped(&mut self, f: impl FnOnce(&mut Self)) {
@@ -512,7 +545,9 @@ impl VisitMut for Rewriter {
         match e {
             Expr::Path(p)
                 if p.qself.is_none()
-                    && p.path.get_ident().is_some_and(|id| self.active.contains(&id.to_string())) =>
+                    && p.path
+                        .get_ident()
+                        .is_some_and(|id| self.active.contains(&id.to_string())) =>
             {
                 let id = p.path.get_ident().unwrap().clone();
                 self.used.insert(id.to_string());
@@ -710,7 +745,10 @@ mod tests {
 
     #[test]
     fn inline_format_args_count_as_uses() {
-        let out = run("let a = 1;\nlet b = 2;\npub fn f() { println!(\"{a} {b:?}\"); }", &["f"]);
+        let out = run(
+            "let a = 1;\nlet b = 2;\npub fn f() { println!(\"{a} {b:?}\"); }",
+            &["f"],
+        );
         assert!(out.contains("let a = a.clone();"));
         assert!(out.contains("let b = b.clone();"));
     }
@@ -733,7 +771,11 @@ mod tests {
 
     #[test]
     fn template_loop_variables_shadow_state() {
-        let out = run_with("let item = 1;", &[], "{#each [1].iter() as item}{item}{/each}");
+        let out = run_with(
+            "let item = 1;",
+            &[],
+            "{#each [1].iter() as item}{item}{/each}",
+        );
         assert!(!out.contains("__WkShared::new"));
     }
 }
