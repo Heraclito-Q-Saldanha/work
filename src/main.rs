@@ -1,32 +1,51 @@
 mod builder;
 mod parser;
+mod transpile;
 
-use std::{fs, path::PathBuf};
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand};
 
-use anyhow::{Context, Result};
-use clap::Parser;
-
+/// Invocado como `cargo wk <comando>`.
 #[derive(Parser)]
+#[command(name = "cargo", bin_name = "cargo")]
+enum Cargo {
+    Wk(Wk),
+}
+
+/// Compila projetos com arquivos .wk (HTML com `<script lang="rs">`).
+#[derive(Args)]
 #[command(version, about)]
-struct Cli {
-    input: PathBuf,
-    #[arg(short, long, default_value = "release")]
-    out_dir: PathBuf,
+struct Wk {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Gera o diretório dist/ com o .wasm e os .html do projeto
+    Build,
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let source =
-        fs::read_to_string(&cli.input).with_context(|| format!("lendo {}", cli.input.display()))?;
-    let name = cli
-        .input
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("index");
+    let Cargo::Wk(Wk { command }) = Cargo::parse();
+    match command {
+        Command::Build => build(),
+    }
+}
 
-    let parsed = parser::parse(&source)?;
-    builder::build_release(&parsed, name, &cli.out_dir)?;
-    println!("gerado em {}", cli.out_dir.display());
+fn build() -> Result<()> {
+    let root = std::env::current_dir()?;
+    if !root.join("Cargo.toml").is_file() {
+        bail!("Cargo.toml não encontrado em {}", root.display());
+    }
 
+    let tmp = tempfile::tempdir()?;
+    let pages = transpile::transpile_project(&root, tmp.path())?;
+    let wasm = builder::compile_wasm(tmp.path(), &root.join("target/wk"))
+        .context("compilando projeto")?;
+
+    let dist = root.join("dist");
+    builder::package(&dist, &wasm, &pages)?;
+    println!("{} página(s) HTML + wasm em {}", pages.len(), dist.display());
     Ok(())
 }

@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+  <head><title>Example</title></head>
+  <body>
+    <h1>Hello from .wk</h1>
+    <a href="about/index.html">About</a>
+    <script lang="rs">
+      #[unsafe(no_mangle)]
+      pub extern "C" fn add(a: i32, b: i32) -> i32 {
+          a + b
+      }
+    </script>
+  </body>
+</html>
