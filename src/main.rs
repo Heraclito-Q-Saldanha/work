@@ -3,6 +3,7 @@ mod loader;
 mod manifest;
 mod parser;
 mod rust;
+mod script;
 mod transpile;
 
 use anyhow::{Context, Result, bail};

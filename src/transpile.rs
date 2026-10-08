@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::{loader, parser, rust};
+use crate::{loader, parser, rust, script};
 
 const IGNORED_DIRS: [&str; 3] = ["target", "dist", ".git"];
 
@@ -50,7 +50,7 @@ pub fn transpile_project(root: &Path, dest: &Path, glue_name: &str) -> Result<Ve
                 let path = file.strip_prefix(&src)?.with_extension("html");
                 let main_fn = parsed.rust.as_ref().map(|_| main_fn_name(&path));
                 if let (Some(code), Some(main_fn)) = (&parsed.rust, &main_fn) {
-                    let code = rust::transform_script(code, &parsed.handlers, main_fn)
+                    let code = script::transform(code, &parsed.handlers, main_fn)
                         .with_context(|| format!("em {}", file.display()))?;
                     write_rs(&file, &code)?;
                 }

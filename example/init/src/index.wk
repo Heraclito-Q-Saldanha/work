@@ -4,8 +4,15 @@
 	}
 
 	let value = "Have a great day!";
+	let mut clicks = 0;
 
-	alert(&format!("Happy: {}", value));
+	pub fn happy() {
+		clicks += 1;
+		alert(&format!("Happy #{clicks}: {value}"));
+	}
+
+	alert(&format!("Loaded with: {}", value));
 </script>
 
 <h1>Cool page</h1>
+<button onclick="happy()">Happy</button>

@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use std::collections::BTreeSet;
 use proc_macro2::LineColumn;
-use syn::{Item, Stmt, spanned::Spanned};
+use syn::{Item, spanned::Spanned};
 
 pub const WASM_BINDGEN_ATTR: &str = "#[::wasm_bindgen::prelude::wasm_bindgen]";
 
@@ -10,29 +10,6 @@ pub fn transform(code: &str, names: &BTreeSet<String>) -> Result<String> {
     let file = syn::parse_file(code).map_err(|e| anyhow!("Rust inválido: {e}"))?;
     let edits = collect_edits(&file.items, names, &Offsets::new(code));
     Ok(apply(code, edits))
-}
-
-/// Traduz o código de um `<script lang="rs">`, que passa a ser o corpo de uma função
-/// exportada chamada `main_name`, executada quando a página carrega.
-pub fn transform_script(code: &str, names: &BTreeSet<String>, main_name: &str) -> Result<String> {
-    let wrapped = format!("pub fn {main_name}() {{\n{code}\n}}\n");
-    let file = syn::parse_file(&wrapped).map_err(|e| anyhow!("Rust inválido: {e}"))?;
-    let Some(Item::Fn(main)) = file.items.first() else {
-        unreachable!("o wrapper é sempre uma função");
-    };
-    let nested: Vec<Item> = main
-        .block
-        .stmts
-        .iter()
-        .filter_map(|s| match s {
-            Stmt::Item(i) => Some(i.clone()),
-            _ => None,
-        })
-        .collect();
-
-    let mut edits = collect_edits(&nested, names, &Offsets::new(&wrapped));
-    edits.push((0, 0, format!("{WASM_BINDGEN_ATTR}\n")));
-    Ok(apply(&wrapped, edits))
 }
 
 /// (início, fim, texto): inserções têm início == fim.
@@ -106,21 +83,6 @@ mod tests {
         assert_eq!(
             out,
             format!("fn other() {{}}\n\n{WASM_BINDGEN_ATTR} /// doc\npub fn add(a: i32) -> i32 {{ a }}\n")
-        );
-        syn::parse_file(&out).unwrap();
-    }
-
-    #[test]
-    fn script_becomes_exported_main_function() {
-        let names = BTreeSet::from(["add".to_string()]);
-        let code = "let x = 1;\nextern \"js\" { fn alert(s: &str); }\nfn add() {}\n";
-        let out = transform_script(code, &names, "__wk_main_index").unwrap();
-        assert_eq!(
-            out,
-            format!(
-                "{a}\npub fn __wk_main_index() {{\nlet x = 1;\n{a}\nextern \"C\" {{ fn alert(s: &str); }}\n{a} fn add() {{}}\n\n}}\n",
-                a = WASM_BINDGEN_ATTR
-            )
         );
         syn::parse_file(&out).unwrap();
     }
