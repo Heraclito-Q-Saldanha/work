@@ -25,7 +25,10 @@ use syn::{
     visit_mut::{self, VisitMut},
 };
 
-use crate::{rust::WASM_BINDGEN_ATTR, template::Region};
+use crate::{
+    rust::WASM_BINDGEN_ATTR,
+    template::{Bind, Region},
+};
 
 const RUNTIME_STATE: &str = r#"
 thread_local! {
@@ -144,11 +147,68 @@ fn __wk_escape(s: &str) -> ::std::string::String {
 }
 "#;
 
+const RUNTIME_BINDS: &str = r#"
+#[::wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = __wk, js_name = set_prop)]
+    fn __wk_set_prop(id: usize, prop: &str, value: &::wasm_bindgen::JsValue);
+}
+
+// Converte o valor de uma propriedade do DOM no tipo da variável ligada.
+#[allow(dead_code)]
+trait __WkFromJs: Sized {
+    fn from_js(v: &::wasm_bindgen::JsValue) -> ::std::option::Option<Self>;
+}
+
+impl __WkFromJs for ::std::string::String {
+    fn from_js(v: &::wasm_bindgen::JsValue) -> ::std::option::Option<Self> {
+        v.as_string()
+    }
+}
+
+impl __WkFromJs for bool {
+    fn from_js(v: &::wasm_bindgen::JsValue) -> ::std::option::Option<Self> {
+        v.as_bool()
+    }
+}
+
+impl<T: __WkFromJs> __WkFromJs for ::std::option::Option<T> {
+    fn from_js(v: &::wasm_bindgen::JsValue) -> ::std::option::Option<Self> {
+        if v.is_null() || v.is_undefined() {
+            ::std::option::Option::Some(::std::option::Option::None)
+        } else {
+            T::from_js(v).map(::std::option::Option::Some)
+        }
+    }
+}
+
+macro_rules! __wk_number {
+    ($($t:ty),*) => {$(
+        impl __WkFromJs for $t {
+            fn from_js(v: &::wasm_bindgen::JsValue) -> ::std::option::Option<Self> {
+                let n = v
+                    .as_f64()
+                    .or_else(|| v.as_string().and_then(|s| s.trim().parse::<f64>().ok()))?;
+                n.is_finite().then(|| n as $t)
+            }
+        }
+    )*};
+}
+__wk_number!(f32, f64, i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
+"#;
+
+/// Nome do export wasm que recebe o valor novo de um `bind:` da página `main_name`.
+pub fn bind_fn_name(main_name: &str, id: usize) -> String {
+    let page = main_name.strip_prefix("__wk_main_").unwrap_or(main_name);
+    format!("__wk_bind_{page}_{id}")
+}
+
 pub fn transform(
     code: &str,
     names: &BTreeSet<String>,
     main_name: &str,
     regions: &[Region],
+    binds: &[Bind],
 ) -> Result<String> {
     let stmts = Block::parse_within
         .parse_str(code)
@@ -175,6 +235,19 @@ pub fn transform(
             }
             other => body.push(other),
         }
+    }
+
+    // O sentido DOM → variável é uma função como as de handler: vira closure e dá flush.
+    for bind in binds {
+        let name = format_ident!("{}", bind_fn_name(main_name, bind.id));
+        let target = &bind.target;
+        exported.push(parse_quote! {
+            pub fn #name(__v: ::wasm_bindgen::JsValue) {
+                if let ::std::option::Option::Some(__x) = __WkFromJs::from_js(&__v) {
+                    #target = __x;
+                }
+            }
+        });
     }
 
     // Só variáveis declaradas uma única vez, com padrão simples, podem virar estado compartilhado.
@@ -207,21 +280,33 @@ pub fn transform(
         used_by_fn.push(rewriter.used);
     }
 
-    let mut region_blocks: Vec<(usize, Block, BTreeSet<String>)> = Vec::new();
+    // Cada binding de região ou de `bind:` (variável → DOM) é um bloco que atualiza o DOM.
+    let mut updates: Vec<Block> = Vec::new();
     for region in regions {
-        let mut block = region.render.clone();
+        let (id, render) = (region.id, &region.render);
+        updates.push(parse_quote!({ __wk_set(#id, &#render); }));
+    }
+    for bind in binds {
+        let (id, prop, target) = (bind.id, &bind.prop, &bind.target);
+        updates.push(parse_quote!({
+            __wk_set_prop(#id, #prop, &::wasm_bindgen::JsValue::from((#target).clone()));
+        }));
+    }
+    let mut region_blocks: Vec<(Block, BTreeSet<String>)> = Vec::new();
+    for mut block in updates {
         let mut rewriter = Rewriter::new(candidates.clone());
         rewriter.visit_block_mut(&mut block);
-        region_blocks.push((region.id, block, rewriter.used));
+        region_blocks.push((block, rewriter.used));
     }
 
     let promoted: BTreeSet<String> = used_by_fn
         .iter()
-        .chain(region_blocks.iter().map(|(_, _, used)| used))
+        .chain(region_blocks.iter().map(|(_, used)| used))
         .flatten()
         .cloned()
         .collect();
-    let has_state = !promoted.is_empty() || !regions.is_empty();
+    let has_dom = !regions.is_empty() || !binds.is_empty();
+    let has_state = !promoted.is_empty() || has_dom;
 
     let mut rewriter = Rewriter::new(promoted.clone());
     let mut main_stmts: Vec<Stmt> = Vec::new();
@@ -254,8 +339,8 @@ pub fn transform(
         statics.push(static_def);
         wrappers.push(wrapper);
     }
-    for (id, block, used) in &region_blocks {
-        registrations.push((after_decls(used), region_binding(*id, block, used)));
+    for (block, used) in &region_blocks {
+        registrations.push((after_decls(used), region_binding(block, used)));
     }
     registrations.sort_by_key(|(at, _)| *at);
 
@@ -284,9 +369,15 @@ pub fn transform(
     } else {
         RUNTIME_REGIONS.parse().unwrap()
     };
+    let bind_rt: TokenStream = if binds.is_empty() {
+        quote!()
+    } else {
+        RUNTIME_BINDS.parse().unwrap()
+    };
     let tokens = quote! {
         #state
         #region_rt
+        #bind_rt
         #(#hoisted)*
         #(#statics)*
         #(#wrappers)*
@@ -300,13 +391,11 @@ pub fn transform(
 }
 
 /// Registro de uma região do template: renderiza agora e quando suas variáveis mudarem.
-fn region_binding(id: usize, block: &Block, used: &BTreeSet<String>) -> Stmt {
+fn region_binding(block: &Block, used: &BTreeSet<String>) -> Stmt {
     let names: Vec<_> = used.iter().map(|v| format_ident!("{v}")).collect();
     parse_quote!({
         #(let #names = #names.clone();)*
-        __wk_bind(&[#(#names.id()),*], move || {
-            __wk_set(#id, &#block);
-        });
+        __wk_bind(&[#(#names.id()),*], move || #block);
     })
 }
 
@@ -692,7 +781,7 @@ mod tests {
     fn run_with(code: &str, names: &[&str], html: &str) -> String {
         let names = names.iter().map(|s| s.to_string()).collect();
         let template = crate::template::compile(html).unwrap();
-        let out = transform(code, &names, "__wk_main_t", &template.regions).unwrap();
+        let out = transform(code, &names, "__wk_main_t", &template.regions, &template.binds).unwrap();
         syn::parse_file(&out).unwrap();
         out
     }

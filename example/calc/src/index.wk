@@ -1,40 +1,20 @@
 <script lang="rs">
-	use crate::util::*;
+	let mut first = 0;
+	let mut second = 0;
+	let mut result = 0;
 
 	pub fn calculate() {
-		let first_element = get_element_by_id("first-number");
-		let second_element = get_element_by_id("second-number");
-		let result_element = get_element_by_id("result");
-
-		let first = get_property(&first_element, &JsValue::from_str("value"))
-			.as_string()
-			.and_then(|value| value.parse::<f64>().ok());
-
-		let second = get_property(&second_element, &JsValue::from_str("value"))
-			.as_string()
-			.and_then(|value| value.parse::<f64>().ok());
-
-		let (Some(first), Some(second)) = (first, second) else {
-			alert("Informe dois números válidos.");
-			return;
-		};
-
-		let updated = set_property(
-			&result_element,
-			&JsValue::from_str("textContent"),
-			&JsValue::from_str(&(first + second).to_string()),
-		);
-		
-		if !updated {
-			alert("Não foi possível exibir o resultado.");
-		}
+		result = first + second;
 	}
 </script>
 
 <h1>Calculadora</h1>
+
 <label for="first-number">Primeiro número</label>
-<input id="first-number" type="number" step="any" value="0">
+<input id="first-number" bind:value={first} step="0.01">
+
 <label for="second-number">Segundo número</label>
-<input id="second-number" type="number" step="any" value="0">
+<input id="second-number" bind:value={second} step="0.01">
+
 <button onclick="calculate()">Somar</button>
-<p>Resultado: <output id="result">0</output></p>
+<p>Resultado: {result}</p>

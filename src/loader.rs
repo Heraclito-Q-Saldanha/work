@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::{script::bind_fn_name, template::Bind};
+
 /// Monta o documento HTML mínimo com `body` dentro de `<body>`, mais um módulo que carrega
 /// o glue do wasm e expõe as exportações em `window`, para que atributos como
 /// `onclick="foo()"` as enxerguem.
@@ -8,7 +10,8 @@ pub fn render_page(
     page: &Path,
     glue_name: &str,
     main_fn: Option<&str>,
-    regions: bool,
+    dynamic: bool,
+    binds: &[Bind],
 ) -> String {
     let depth = page.components().count().saturating_sub(1);
     let prefix = if depth == 0 {
@@ -16,8 +19,21 @@ pub fn render_page(
     } else {
         "../".repeat(depth)
     };
-    let run_main = main_fn.map_or(String::new(), |f| format!("wasm.{f}();\n"));
-    let region_runtime = if regions { REGION_RUNTIME } else { "" };
+    let mut run_main = main_fn.map_or(String::new(), |f| format!("wasm.{f}();\n"));
+    if let Some(main_fn) = main_fn.filter(|_| !binds.is_empty()) {
+        let list: Vec<_> = binds
+            .iter()
+            .map(|b| serde_json::json!([b.id, b.event, bind_fn_name(main_fn, b.id), b.prop]))
+            .collect();
+        run_main.push_str(&format!(
+            "for (const [id, event, fn, prop] of {}) {{\n  \
+               const el = document.querySelector(`[data-wk-b${{id}}]`);\n  \
+               el.addEventListener(event, () => wasm[fn](el[prop]));\n\
+             }}\n",
+            serde_json::Value::Array(list)
+        ));
+    }
+    let region_runtime = if dynamic { REGION_RUNTIME } else { "" };
     let script = format!(
         "<script type=\"module\">\n\
          {region_runtime}\
@@ -61,6 +77,10 @@ window.__wk = {
     range.deleteContents();
     range.insertNode(range.createContextualFragment(html));
   },
+  set_prop(id, prop, value) {
+    const el = document.querySelector(`[data-wk-b${id}]`);
+    if (el && el[prop] !== value) el[prop] = value;
+  },
 };
 ";
 
@@ -89,6 +109,7 @@ mod tests {
             "app",
             Some("__wk_main_a__b"),
             false,
+            &[],
         );
         assert!(
             out.starts_with("<!DOCTYPE html>\n<html>\n  <head></head>\n  <body>\n    <p>fuu</p>\n")

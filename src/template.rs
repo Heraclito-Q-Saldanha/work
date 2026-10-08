@@ -3,7 +3,9 @@
 //! - `{expr}`: valor de uma expressão Rust (escapado);
 //! - `{#if cond}…{:else if cond}…{:else}…{/if}`;
 //! - `{#each iter as item}…{/each}` e `{#each iter as item, i}…{/each}`;
-//! - `{{` e `}}` produzem `{` e `}` literais.
+//! - `{{` e `}}` produzem `{` e `}` literais;
+//! - `bind:prop={var}` (ou `bind:prop|evento={var}`) em uma tag de nível superior: liga a
+//!   propriedade `prop` do elemento à variável nos dois sentidos.
 //!
 //! Cada trecho dinâmico de nível superior vira uma *região*: um par de comentários
 //! `<!--wk:N-->…<!--/wk:N-->` no HTML e um bloco Rust que devolve o HTML da região.
@@ -21,10 +23,31 @@ pub struct Region {
     pub render: Block,
 }
 
+/// Ligação bidirecional entre uma propriedade de um elemento e uma expressão atribuível.
+pub struct Bind {
+    pub id: usize,
+    pub prop: String,
+    pub event: String,
+    pub target: Expr,
+}
+
 pub struct Template {
     /// HTML estático, com as âncoras das regiões.
     pub html: String,
     pub regions: Vec<Region>,
+    pub binds: Vec<Bind>,
+}
+
+/// Evento que sinaliza mudança de cada propriedade conhecida.
+fn default_event(prop: &str) -> Option<&'static str> {
+    match prop {
+        "value" | "valueAsNumber" | "valueAsDate" | "textContent" | "innerText" | "innerHTML" => {
+            Some("input")
+        }
+        "checked" | "indeterminate" | "files" | "selectedIndex" => Some("change"),
+        "open" => Some("toggle"),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -59,7 +82,7 @@ enum Node {
 }
 
 pub fn compile(html: &str) -> Result<Template> {
-    let tokens = tokenize(html)?;
+    let (tokens, binds) = tokenize(html)?;
     let mut iter = tokens.into_iter().peekable();
     let nodes = parse_nodes(&mut iter)?;
     if let Some(tok) = iter.next() {
@@ -85,7 +108,11 @@ pub fn compile(html: &str) -> Result<Template> {
             }
         }
     }
-    Ok(Template { html: out, regions })
+    Ok(Template {
+        html: out,
+        regions,
+        binds,
+    })
 }
 
 fn describe(tok: &Tok) -> &'static str {
@@ -106,15 +133,17 @@ struct Lexer {
     pos: usize,
     raw: String,
     toks: Vec<Tok>,
+    binds: Vec<Bind>,
     depth: usize,
 }
 
-fn tokenize(src: &str) -> Result<Vec<Tok>> {
+fn tokenize(src: &str) -> Result<(Vec<Tok>, Vec<Bind>)> {
     let mut lx = Lexer {
         chars: src.chars().collect(),
         pos: 0,
         raw: String::new(),
         toks: vec![],
+        binds: vec![],
         depth: 0,
     };
     let mut in_tag = false;
@@ -166,6 +195,15 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
             continue;
         }
 
+        if in_tag
+            && quote_char.is_none()
+            && lx.starts_with("bind:")
+            && lx.raw.ends_with(|c: char| c.is_whitespace())
+        {
+            lx.bind(raw_text_element.is_some())?;
+            continue;
+        }
+
         if c == '{' {
             if lx.chars.get(lx.pos + 1) == Some(&'{') {
                 lx.raw.push('{');
@@ -187,7 +225,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
         bail!("bloco `{{#if}}`/`{{#each}}` sem fechamento");
     }
     lx.flush();
-    Ok(lx.toks)
+    Ok((lx.toks, lx.binds))
 }
 
 impl Lexer {
@@ -232,6 +270,77 @@ impl Lexer {
             self.raw.push(self.chars[self.pos]);
             self.pos += 1;
         }
+    }
+
+    /// Lê `bind:prop[|evento]={expr}` (ou `="{expr}"`) e o troca por `data-wk-b<N>`.
+    fn bind(&mut self, raw_text: bool) -> Result<()> {
+        if self.depth > 0 {
+            bail!("`bind:` ainda não é suportado dentro de `{{#if}}`/`{{#each}}`");
+        }
+        if raw_text {
+            bail!("`bind:` não é suportado em <script>/<style>");
+        }
+        self.pos += "bind:".len();
+        let word = |lx: &mut Lexer, stop: &[char]| {
+            let start = lx.pos;
+            while lx
+                .chars
+                .get(lx.pos)
+                .is_some_and(|c| !stop.contains(c) && !c.is_whitespace() && *c != '>')
+            {
+                lx.pos += 1;
+            }
+            lx.chars[start..lx.pos].iter().collect::<String>()
+        };
+        let prop = word(self, &['=', '|']);
+        let explicit = if self.chars.get(self.pos) == Some(&'|') {
+            self.pos += 1;
+            Some(word(self, &['=']))
+        } else {
+            None
+        };
+        if prop.is_empty()
+            || !prop.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            bail!("nome de propriedade inválido em `bind:{prop}`");
+        }
+        let event = match explicit {
+            Some(e) if !e.is_empty() => e,
+            Some(_) => bail!("evento vazio em `bind:{prop}|`"),
+            None => default_event(&prop)
+                .ok_or_else(|| {
+                    anyhow!("`bind:{prop}` precisa de um evento: bind:{prop}|evento={{var}}")
+                })?
+                .to_string(),
+        };
+        if self.chars.get(self.pos) != Some(&'=') {
+            bail!("`bind:{prop}` precisa de um valor: bind:{prop}={{var}}");
+        }
+        self.pos += 1;
+        let quoted = matches!(self.chars.get(self.pos), Some('"' | '\''));
+        if quoted {
+            self.pos += 1;
+        }
+        if self.chars.get(self.pos) != Some(&'{') {
+            bail!("o valor de `bind:{prop}` deve ser `{{expressão}}`");
+        }
+        let inner = self.read_braced()?;
+        if quoted {
+            self.pos += 1;
+        }
+        let target = parse_expr(inner.trim())?;
+        if !is_assignable(&target) {
+            bail!("`bind:{prop}={{{}}}` precisa de uma variável, campo ou índice", inner.trim());
+        }
+        let id = self.binds.len();
+        self.binds.push(Bind {
+            id,
+            prop,
+            event,
+            target,
+        });
+        self.raw.push_str(&format!("data-wk-b{id}"));
+        Ok(())
     }
 
     fn directive(&mut self, in_tag: bool) -> Result<()> {
@@ -312,6 +421,16 @@ impl Lexer {
         }
         let snippet: String = self.chars[start..].iter().take(30).collect();
         bail!("chave sem fechamento em `{snippet}`")
+    }
+}
+
+fn is_assignable(e: &Expr) -> bool {
+    match e {
+        Expr::Path(_) => true,
+        Expr::Field(f) => is_assignable(&f.base),
+        Expr::Index(i) => is_assignable(&i.expr),
+        Expr::Paren(p) => is_assignable(&p.expr),
+        _ => false,
     }
 }
 
@@ -537,5 +656,27 @@ mod tests {
         assert!(compile("x{/if}").is_err());
         assert!(compile("{#each a}x{/each}").is_err());
         assert!(compile("{:else}").is_err());
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_binds() {
+        let t = compile(r#"<input bind:value={name}> <input bind:scrollTop|scroll="{ s.y }">"#)
+            .unwrap();
+        assert_eq!(t.binds.len(), 2);
+        assert_eq!((t.binds[0].prop.as_str(), t.binds[0].event.as_str()), ("value", "input"));
+        assert_eq!(t.binds[1].event, "scroll");
+        assert_eq!(t.html, "<input data-wk-b0> <input data-wk-b1>");
+    }
+
+    #[test]
+    fn rejects_bad_binds() {
+        assert!(compile("<input bind:foo={x}>").is_err());
+        assert!(compile("<input bind:value={f(x)}>").is_err());
+        assert!(compile("{#if c}<input bind:value={x}>{/if}").is_err());
     }
 }

@@ -50,14 +50,15 @@ pub fn transpile_project(root: &Path, dest: &Path, glue_name: &str) -> Result<Ve
                 let path = file.strip_prefix(&src)?.with_extension("html");
                 let template = template::compile(&parsed.html)
                     .with_context(|| format!("em {}", file.display()))?;
-                let has_regions = !template.regions.is_empty();
-                let main_fn = (parsed.rust.is_some() || has_regions).then(|| main_fn_name(&path));
+                let is_dynamic = !template.regions.is_empty() || !template.binds.is_empty();
+                let main_fn = (parsed.rust.is_some() || is_dynamic).then(|| main_fn_name(&path));
                 if let Some(main_fn) = &main_fn {
                     let code = script::transform(
                         parsed.rust.as_deref().unwrap_or_default(),
                         &parsed.handlers,
                         main_fn,
                         &template.regions,
+                        &template.binds,
                     )
                     .with_context(|| format!("em {}", file.display()))?;
                     write_rs(&file, &code)?;
@@ -68,7 +69,8 @@ pub fn transpile_project(root: &Path, dest: &Path, glue_name: &str) -> Result<Ve
                     &path,
                     glue_name,
                     main_fn.as_deref(),
-                    has_regions,
+                    is_dynamic,
+                    &template.binds,
                 );
                 pages.push(Page { path, html });
             }
