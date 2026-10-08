@@ -1,0 +1,11 @@
+<script lang="rs">
+	extern "js" {
+		pub fn alert(s: &str);
+	}
+
+	let value = "Have a great day!";
+
+	alert(&format!("Happy: {}", value));
+</script>
+
+<h1>Cool page</h1>

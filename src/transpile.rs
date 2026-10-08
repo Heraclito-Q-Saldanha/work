@@ -47,14 +47,15 @@ pub fn transpile_project(root: &Path, dest: &Path, glue_name: &str) -> Result<Ve
                     parser::parse(&source).with_context(|| format!("em {}", file.display()))?;
                 handlers.extend(parsed.handlers.iter().cloned());
 
-                if let Some(code) = &parsed.rust {
-                    let code = rust::transform(code, &parsed.handlers)
+                let path = file.strip_prefix(&src)?.with_extension("html");
+                let main_fn = parsed.rust.as_ref().map(|_| main_fn_name(&path));
+                if let (Some(code), Some(main_fn)) = (&parsed.rust, &main_fn) {
+                    let code = rust::transform_script(code, &parsed.handlers, main_fn)
                         .with_context(|| format!("em {}", file.display()))?;
                     write_rs(&file, &code)?;
                 }
                 fs::remove_file(&file)?;
-                let path = file.strip_prefix(&src)?.with_extension("html");
-                let html = loader::render_page(&parsed.html, &path, glue_name);
+                let html = loader::render_page(&parsed.html, &path, glue_name, main_fn.as_deref());
                 pages.push(Page { path, html });
             }
             FileKind::RustOnly => rust_only.push(file),
@@ -71,6 +72,21 @@ pub fn transpile_project(root: &Path, dest: &Path, glue_name: &str) -> Result<Ve
         fs::remove_file(&file)?;
     }
     Ok(pages)
+}
+
+/// Nome único da função de entrada de uma página, derivado do seu caminho.
+fn main_fn_name(page: &Path) -> String {
+    let sanitized: String = page
+        .with_extension("")
+        .to_string_lossy()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' => "__".to_string(),
+            c if c.is_ascii_alphanumeric() => c.to_string(),
+            _ => "_".to_string(),
+        })
+        .collect();
+    format!("__wk_main_{sanitized}")
 }
 
 enum FileKind {
