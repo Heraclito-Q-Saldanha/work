@@ -1,0 +1,47 @@
+{
+  "scopeName": "source.wk",
+  "fileTypes": [
+    "wk"
+  ],
+  "patterns": [
+    {
+      "name": "meta.embedded.block.rust",
+      "begin": "(?i:(<)(script)\\b(?=[^>]*\\blang\\s*=\\s*(?-i:\"rs\"|'rs'|rs(?=[\\s/>])))([^>]*)(>))",
+      "beginCaptures": {
+        "1": {
+          "name": "punctuation.definition.tag.begin.html"
+        },
+        "2": {
+          "name": "entity.name.tag.html"
+        },
+        "3": {
+          "name": "meta.tag.attributes.html"
+        },
+        "4": {
+          "name": "punctuation.definition.tag.end.html"
+        }
+      },
+      "end": "(?i:(</)(script)(\\s*>))",
+      "endCaptures": {
+        "1": {
+          "name": "punctuation.definition.tag.begin.html"
+        },
+        "2": {
+          "name": "entity.name.tag.html"
+        },
+        "3": {
+          "name": "punctuation.definition.tag.end.html"
+        }
+      },
+      "contentName": "source.rust",
+      "patterns": [
+        {
+          "include": "source.rust"
+        }
+      ]
+    },
+    {
+      "include": "text.html.basic"
+    }
+  ]
+}

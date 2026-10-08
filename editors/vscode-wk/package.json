@@ -1,0 +1,41 @@
+{
+  "name": "wk-syntax",
+  "displayName": "WK Syntax",
+  "description": "Syntax highlighting for WK files with embedded Rust.",
+  "version": "0.1.0",
+  "publisher": "work",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "extensionDependencies": [
+    "rust-lang.rust-analyzer"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "wk",
+        "aliases": [
+          "WK",
+          "wk"
+        ],
+        "extensions": [
+          ".wk"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "wk",
+        "scopeName": "source.wk",
+        "path": "./syntaxes/wk.tmLanguage.json",
+        "embeddedLanguages": {
+          "source.rust": "rust"
+        }
+      }
+    ]
+  }
+}
