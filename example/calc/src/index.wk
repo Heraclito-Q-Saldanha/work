@@ -1,7 +1,6 @@
 <script lang="rs">
 	let mut first = 0;
 	let mut second = 0;
-	let mut result = derived!(first + second);
 </script>
 
 <h1>Calculadora</h1>
@@ -9,4 +8,4 @@
 <input bind:value={first} step="1">
 <input bind:value={second} step="1">
 
-<p>Resultado: {result}</p>
+<p>Resultado: {first + second}</p>
