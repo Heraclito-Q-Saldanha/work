@@ -299,9 +299,7 @@ impl Lexer {
         } else {
             None
         };
-        if prop.is_empty()
-            || !prop.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        if prop.is_empty() || !prop.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             bail!("nome de propriedade inválido em `bind:{prop}`");
         }
         let event = match explicit {
@@ -330,7 +328,10 @@ impl Lexer {
         }
         let target = parse_expr(inner.trim())?;
         if !is_assignable(&target) {
-            bail!("`bind:{prop}={{{}}}` precisa de uma variável, campo ou índice", inner.trim());
+            bail!(
+                "`bind:{prop}={{{}}}` precisa de uma variável, campo ou índice",
+                inner.trim()
+            );
         }
         let id = self.binds.len();
         self.binds.push(Bind {
@@ -668,7 +669,10 @@ mod bind_tests {
         let t = compile(r#"<input bind:value={name}> <input bind:scrollTop|scroll="{ s.y }">"#)
             .unwrap();
         assert_eq!(t.binds.len(), 2);
-        assert_eq!((t.binds[0].prop.as_str(), t.binds[0].event.as_str()), ("value", "input"));
+        assert_eq!(
+            (t.binds[0].prop.as_str(), t.binds[0].event.as_str()),
+            ("value", "input")
+        );
         assert_eq!(t.binds[1].event, "scroll");
         assert_eq!(t.html, "<input data-wk-b0> <input data-wk-b1>");
     }

@@ -1,20 +1,12 @@
 <script lang="rs">
 	let mut first = 0;
 	let mut second = 0;
-	let mut result = 0;
-
-	pub fn calculate() {
-		result = first + second;
-	}
+	let mut result = derived!(first + second);
 </script>
 
 <h1>Calculadora</h1>
 
-<label for="first-number">Primeiro número</label>
-<input id="first-number" bind:value={first} step="0.01">
+<input bind:value={first} step="1">
+<input bind:value={second} step="1">
 
-<label for="second-number">Segundo número</label>
-<input id="second-number" bind:value={second} step="0.01">
-
-<button onclick="calculate()">Somar</button>
 <p>Resultado: {result}</p>

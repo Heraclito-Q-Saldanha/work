@@ -35,6 +35,8 @@ thread_local! {
     static __WK_NEXT_ID: ::std::cell::Cell<usize> = ::std::cell::Cell::new(0);
     static __WK_DIRTY: ::std::cell::RefCell<::std::vec::Vec<usize>> =
         ::std::cell::RefCell::new(::std::vec::Vec::new());
+    static __WK_DERIVED: ::std::cell::RefCell<::std::vec::Vec<usize>> =
+        ::std::cell::RefCell::new(::std::vec::Vec::new());
     static __WK_BINDINGS: ::std::cell::RefCell<::std::vec::Vec<(::std::vec::Vec<usize>, ::std::rc::Rc<dyn Fn()>)>> =
         ::std::cell::RefCell::new(::std::vec::Vec::new());
 }
@@ -103,24 +105,38 @@ fn __wk_bind(deps: &[usize], render: impl Fn() + 'static) {
     __WK_BINDINGS.with(|b| b.borrow_mut().push((deps.to_vec(), ::std::rc::Rc::new(render))));
 }
 
+// Atualiza uma variável derivada; só propaga se o valor mudou.
+#[allow(dead_code)]
+fn __wk_set_derived<T: PartialEq>(slot: &__WkShared<T>, value: T) {
+    if *slot.get() != value {
+        *slot.get() = value;
+        __WK_DERIVED.with(|d| d.borrow_mut().push(slot.id));
+    }
+}
+
 #[allow(dead_code)]
 fn __wk_flush() {
-    let dirty = __WK_DIRTY.with(|d| ::std::mem::take(&mut *d.borrow_mut()));
-    if dirty.is_empty() {
-        return;
+    // Cada passada pode alterar variáveis derivadas, que sujam as bindings seguintes.
+    for _ in 0..100 {
+        let dirty = __WK_DIRTY.with(|d| ::std::mem::take(&mut *d.borrow_mut()));
+        if dirty.is_empty() {
+            return;
+        }
+        let stale: ::std::vec::Vec<::std::rc::Rc<dyn Fn()>> = __WK_BINDINGS.with(|b| {
+            b.borrow()
+                .iter()
+                .filter(|(deps, _)| deps.iter().any(|d| dirty.contains(d)))
+                .map(|(_, f)| f.clone())
+                .collect()
+        });
+        for render in stale {
+            render();
+        }
+        // Renderizar só lê, mas métodos usados como receptor marcam a variável como suja.
+        let changed = __WK_DERIVED.with(|d| ::std::mem::take(&mut *d.borrow_mut()));
+        __WK_DIRTY.with(|d| *d.borrow_mut() = changed);
     }
-    let stale: ::std::vec::Vec<::std::rc::Rc<dyn Fn()>> = __WK_BINDINGS.with(|b| {
-        b.borrow()
-            .iter()
-            .filter(|(deps, _)| deps.iter().any(|d| dirty.contains(d)))
-            .map(|(_, f)| f.clone())
-            .collect()
-    });
-    for render in stale {
-        render();
-    }
-    // Renderizar só lê, mas métodos usados como receptor marcam a variável como suja.
-    __WK_DIRTY.with(|d| d.borrow_mut().clear());
+    ::std::panic!("ciclo entre variáveis derived!/effect!");
 }
 "#;
 
@@ -250,6 +266,33 @@ pub fn transform(
         });
     }
 
+    // `let x = derived!(expr);` e `effect!(expr);` viram bindings reativas.
+    let mut derived_names: BTreeSet<String> = BTreeSet::new();
+    let mut effect_exprs: BTreeMap<usize, Expr> = BTreeMap::new();
+    for (i, stmt) in body.iter_mut().enumerate() {
+        match stmt {
+            Stmt::Local(Local {
+                init: Some(init), ..
+            }) if macro_named(&init.expr, "derived").is_some() => {
+                let expr = macro_arg(macro_named(&init.expr, "derived").unwrap(), "derived!")?;
+                init.expr = Box::new(expr);
+                let name = simple_decl(stmt).ok_or_else(|| {
+                    anyhow!(
+                        "`derived!` precisa de `let nome = derived!(...)` ou `let nome: T = ...`"
+                    )
+                })?;
+                derived_names.insert(name);
+            }
+            Stmt::Macro(m) if m.mac.path.is_ident("effect") => {
+                effect_exprs.insert(i, macro_arg(&m.mac, "effect!")?);
+            }
+            Stmt::Expr(Expr::Macro(m), _) if m.mac.path.is_ident("effect") => {
+                effect_exprs.insert(i, macro_arg(&m.mac, "effect!")?);
+            }
+            _ => {}
+        }
+    }
+
     // Só variáveis declaradas uma única vez, com padrão simples, podem virar estado compartilhado.
     let mut declared: BTreeMap<String, usize> = BTreeMap::new();
     for stmt in &body {
@@ -299,23 +342,66 @@ pub fn transform(
         region_blocks.push((block, rewriter.used));
     }
 
+    let mut derived_regs: BTreeMap<String, (Expr, BTreeSet<String>)> = BTreeMap::new();
+    for stmt in &body {
+        if let (
+            Some(name),
+            Stmt::Local(Local {
+                init: Some(init), ..
+            }),
+        ) = (simple_decl(stmt), stmt)
+            && derived_names.contains(&name)
+        {
+            let mut expr = (*init.expr).clone();
+            let mut rewriter = Rewriter::new(candidates.clone());
+            rewriter.visit_expr_mut(&mut expr);
+            if rewriter.used.contains(&name) {
+                return Err(anyhow!("`{name}` depende de si mesma em `derived!`"));
+            }
+            derived_regs.insert(name, (expr, rewriter.used));
+        }
+    }
+    let mut effect_regs: BTreeMap<usize, (Expr, BTreeSet<String>)> = BTreeMap::new();
+    for (i, expr) in &effect_exprs {
+        let mut expr = expr.clone();
+        let mut rewriter = Rewriter::new(candidates.clone());
+        rewriter.visit_expr_mut(&mut expr);
+        effect_regs.insert(*i, (expr, rewriter.used));
+    }
+
     let promoted: BTreeSet<String> = used_by_fn
         .iter()
         .chain(region_blocks.iter().map(|(_, used)| used))
+        .chain(derived_regs.values().map(|(_, used)| used))
+        .chain(effect_regs.values().map(|(_, used)| used))
         .flatten()
+        .chain(&derived_names)
         .cloned()
         .collect();
     let has_dom = !regions.is_empty() || !binds.is_empty();
-    let has_state = !promoted.is_empty() || has_dom;
+    let has_state = !promoted.is_empty() || has_dom || !effect_regs.is_empty();
 
     let mut rewriter = Rewriter::new(promoted.clone());
     let mut main_stmts: Vec<Stmt> = Vec::new();
     let mut decl_end: BTreeMap<String, usize> = BTreeMap::new();
-    for mut stmt in body {
+    let mut registrations: Vec<(usize, Stmt)> = Vec::new();
+    for (i, mut stmt) in body.into_iter().enumerate() {
+        if let Some((expr, used)) = effect_regs.get(&i) {
+            let at = used.iter().filter_map(|v| decl_end.get(v)).max().copied();
+            registrations.push((
+                at.unwrap_or(0).max(main_stmts.len()),
+                effect_binding(expr, used),
+            ));
+            continue;
+        }
         match simple_decl(&stmt).filter(|n| promoted.contains(n)) {
             Some(name) => {
                 stmt = share_declaration(stmt, &mut rewriter);
-                decl_end.insert(name, main_stmts.len() + 1);
+                let end = main_stmts.len() + 1;
+                decl_end.insert(name.clone(), end);
+                if let Some((expr, used)) = derived_regs.get(&name) {
+                    registrations.push((end, derived_binding(&name, expr, used)));
+                }
             }
             None => rewriter.visit_stmt_mut(&mut stmt),
         }
@@ -330,7 +416,6 @@ pub fn transform(
             .copied()
             .unwrap_or(0)
     };
-    let mut registrations: Vec<(usize, Stmt)> = Vec::new();
     let mut statics: Vec<TokenStream> = Vec::new();
     let mut wrappers: Vec<TokenStream> = Vec::new();
     for (f, used) in exported.iter().zip(&used_by_fn) {
@@ -396,6 +481,61 @@ fn region_binding(block: &Block, used: &BTreeSet<String>) -> Stmt {
     parse_quote!({
         #(let #names = #names.clone();)*
         __wk_bind(&[#(#names.id()),*], move || #block);
+    })
+}
+
+fn macro_named<'a>(expr: &'a Expr, name: &str) -> Option<&'a Macro> {
+    match expr {
+        Expr::Macro(m) if m.mac.path.is_ident(name) => Some(&m.mac),
+        _ => None,
+    }
+}
+
+/// Argumento de `derived!(...)`/`effect!(...)`; `|| corpo` vale como `corpo`.
+fn macro_arg(mac: &Macro, what: &str) -> Result<Expr> {
+    let expr: Expr = mac
+        .parse_body()
+        .map_err(|e| anyhow!("argumento inválido em `{what}`: {e}"))?;
+    Ok(match expr {
+        Expr::Closure(c) if c.inputs.is_empty() => *c.body,
+        e => e,
+    })
+}
+
+fn clone_names(names: &BTreeSet<String>) -> Vec<TokenStream> {
+    names
+        .iter()
+        .map(|v| {
+            let v = format_ident!("{v}");
+            quote!(let #v = #v.clone();)
+        })
+        .collect()
+}
+
+/// `let nome = derived!(expr)`: recalcula `nome` quando as variáveis de `expr` mudam.
+fn derived_binding(name: &str, expr: &Expr, used: &BTreeSet<String>) -> Stmt {
+    let ident = format_ident!("{name}");
+    let mut owned = used.clone();
+    owned.insert(name.to_string());
+    let clones = clone_names(&owned);
+    let ids = used.iter().map(|v| format_ident!("{v}"));
+    parse_quote!({
+        #(#clones)*
+        __wk_bind(&[#(#ids.id()),*], move || {
+            __wk_set_derived(&#ident, #expr);
+        });
+    })
+}
+
+/// `effect!(expr)`: executa agora e de novo quando as variáveis de `expr` mudam.
+fn effect_binding(expr: &Expr, used: &BTreeSet<String>) -> Stmt {
+    let clones = clone_names(used);
+    let ids = used.iter().map(|v| format_ident!("{v}"));
+    parse_quote!({
+        #(#clones)*
+        __wk_bind(&[#(#ids.id()),*], move || {
+            let _ = #expr;
+        });
     })
 }
 
@@ -781,7 +921,14 @@ mod tests {
     fn run_with(code: &str, names: &[&str], html: &str) -> String {
         let names = names.iter().map(|s| s.to_string()).collect();
         let template = crate::template::compile(html).unwrap();
-        let out = transform(code, &names, "__wk_main_t", &template.regions, &template.binds).unwrap();
+        let out = transform(
+            code,
+            &names,
+            "__wk_main_t",
+            &template.regions,
+            &template.binds,
+        )
+        .unwrap();
         syn::parse_file(&out).unwrap();
         out
     }
@@ -866,5 +1013,33 @@ mod tests {
             "{#each [1].iter() as item}{item}{/each}",
         );
         assert!(!out.contains("__WkShared::new"));
+    }
+}
+
+#[cfg(test)]
+mod reactive_tests {
+    use super::*;
+
+    fn run(code: &str, html: &str) -> Result<String> {
+        let t = crate::template::compile(html).unwrap();
+        transform(code, &BTreeSet::new(), "__wk_main_t", &t.regions, &t.binds)
+    }
+
+    #[test]
+    fn derived_and_effect_become_bindings() {
+        let out = run(
+            "let mut a = 1; let b = derived!(a * 2); effect!(println!(\"{b}\"));",
+            "{b}",
+        )
+        .unwrap();
+        assert!(out.contains("__wk_set_derived(&b"));
+        assert!(out.matches("__wk_bind(").count() >= 3);
+        assert!(!out.contains("derived!("));
+        assert!(!out.contains("effect!("));
+    }
+
+    #[test]
+    fn self_reference_is_rejected() {
+        assert!(run("let a = derived!(a + 1);", "").is_err());
     }
 }

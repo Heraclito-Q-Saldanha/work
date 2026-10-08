@@ -1,6 +1,17 @@
 <script lang="rs">
+	extern "js" {
+		#[wasm_bindgen(js_namespace = console)]
+		fn log(s: &str);
+	}
+
 	let mut clicks = 0;
 	let mut items = Vec::new();
+	let mut name = String::new();
+	
+	let doubled = derived!(clicks * 2);
+	let summary = derived!(format!("{name}: {clicks} clicks, doubled {doubled}"));
+	
+	effect!(log(&summary));
 
 	pub fn happy() {
 		clicks += 1;
@@ -9,6 +20,7 @@
 
 	pub fn reset() {
 		clicks = 0;
+		name.clear();
 		items.clear();
 	}
 </script>
@@ -18,7 +30,8 @@
 <button onclick="happy()">Happy</button>
 <button onclick="reset()">Reset</button>
 
-<p>Clicks: {clicks}</p>
+<input bind:value={name} placeholder="name">
+<p>{summary}</p>
 
 {#if clicks > 3}
 	<p>Many clicks!</p>
