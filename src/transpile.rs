@@ -36,7 +36,7 @@ pub fn transpile_project(root: &Path, dest: &Path, glue_name: &str) -> Result<Ve
         let parsed = parser::parse(&source).with_context(|| format!("em {}", wk.display()))?;
 
         if let Some(code) = parsed.rust {
-            let code = rust::export_functions(&code, &parsed.handlers)
+            let code = rust::transform(&code, &parsed.handlers)
                 .with_context(|| format!("em {}", wk.display()))?;
             let rs = wk.with_extension("rs");
             if rs.exists() {
