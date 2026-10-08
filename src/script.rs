@@ -3,7 +3,12 @@
 //! O script roda quando a página carrega, então o código vira o corpo de uma função
 //! exportada (`__wk_main_*`). As funções chamadas por atributos de evento viram closures
 //! guardadas em `thread_local!`, com wrappers exportados que as chamam. Os `let` de nível
-//! superior usados por essas funções passam a ser estado compartilhado (`__WkShared`).
+//! superior usados por essas funções ou pelos templates do HTML passam a ser estado
+//! compartilhado (`__WkShared`).
+//!
+//! Cada região do template (ver [`crate::template`]) vira uma *binding*: uma closure que
+//! gera o HTML da região, assinada nos ids das variáveis que usa. Escritas nas variáveis
+//! (`get_mut`) as marcam como sujas, e `__wk_flush` reexecuta só as bindings afetadas.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,7 +16,8 @@ use anyhow::{Result, anyhow};
 use proc_macro2::TokenStream;
 use quote::{ToTokens, format_ident, quote};
 use syn::{
-    Block, Expr, FnArg, Item, ItemFn, Local, Macro, Pat, PatIdent, ReturnType, Stmt, Token, Type,
+    Block, Expr, FnArg, Item, ItemFn, Lit, Local, Macro, Pat, PatIdent, ReturnType, Stmt, Token,
+    Type, UnOp,
     parse::Parser,
     parse_quote,
     punctuated::Punctuated,
@@ -19,27 +25,57 @@ use syn::{
     visit_mut::{self, VisitMut},
 };
 
-use crate::rust::WASM_BINDGEN_ATTR;
+use crate::{rust::WASM_BINDGEN_ATTR, template::Region};
 
-const SHARED_HELPER: &str = r#"
+const RUNTIME_STATE: &str = r#"
+thread_local! {
+    static __WK_NEXT_ID: ::std::cell::Cell<usize> = ::std::cell::Cell::new(0);
+    static __WK_DIRTY: ::std::cell::RefCell<::std::vec::Vec<usize>> =
+        ::std::cell::RefCell::new(::std::vec::Vec::new());
+    static __WK_BINDINGS: ::std::cell::RefCell<::std::vec::Vec<(::std::vec::Vec<usize>, ::std::rc::Rc<dyn Fn()>)>> =
+        ::std::cell::RefCell::new(::std::vec::Vec::new());
+}
+
 // Estado compartilhado entre as funções do script. O wasm roda em uma única thread, então
 // o acesso sem checagem de empréstimo é aceitável aqui.
-struct __WkShared<T>(::std::rc::Rc<::std::cell::UnsafeCell<T>>);
+#[allow(dead_code)]
+struct __WkShared<T> {
+    id: usize,
+    cell: ::std::rc::Rc<::std::cell::UnsafeCell<T>>,
+}
 
+#[allow(dead_code)]
 impl<T> __WkShared<T> {
     fn new(value: T) -> Self {
-        Self(::std::rc::Rc::new(::std::cell::UnsafeCell::new(value)))
+        let id = __WK_NEXT_ID.with(|n| {
+            let id = n.get();
+            n.set(id + 1);
+            id
+        });
+        Self { id, cell: ::std::rc::Rc::new(::std::cell::UnsafeCell::new(value)) }
     }
 
+    fn id(&self) -> usize {
+        self.id
+    }
+
+    // Leitura.
     #[allow(clippy::mut_from_ref)]
     fn get(&self) -> &mut T {
-        unsafe { &mut *self.0.get() }
+        unsafe { &mut *self.cell.get() }
+    }
+
+    // Possível escrita: marca a variável como suja.
+    #[allow(clippy::mut_from_ref)]
+    fn get_mut(&self) -> &mut T {
+        __WK_DIRTY.with(|d| d.borrow_mut().push(self.id));
+        self.get()
     }
 }
 
 impl<T> Clone for __WkShared<T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self { id: self.id, cell: self.cell.clone() }
     }
 }
 
@@ -54,9 +90,66 @@ impl<T: ::std::fmt::Debug> ::std::fmt::Debug for __WkShared<T> {
         ::std::fmt::Debug::fmt(self.get(), f)
     }
 }
+
+// Renderiza uma vez e reexecuta quando alguma variável em `deps` for escrita.
+#[allow(dead_code)]
+fn __wk_bind(deps: &[usize], render: impl Fn() + 'static) {
+    let pending = __WK_DIRTY.with(|d| d.borrow().len());
+    render();
+    __WK_DIRTY.with(|d| d.borrow_mut().truncate(pending));
+    __WK_BINDINGS.with(|b| b.borrow_mut().push((deps.to_vec(), ::std::rc::Rc::new(render))));
+}
+
+#[allow(dead_code)]
+fn __wk_flush() {
+    let dirty = __WK_DIRTY.with(|d| ::std::mem::take(&mut *d.borrow_mut()));
+    if dirty.is_empty() {
+        return;
+    }
+    let stale: ::std::vec::Vec<::std::rc::Rc<dyn Fn()>> = __WK_BINDINGS.with(|b| {
+        b.borrow()
+            .iter()
+            .filter(|(deps, _)| deps.iter().any(|d| dirty.contains(d)))
+            .map(|(_, f)| f.clone())
+            .collect()
+    });
+    for render in stale {
+        render();
+    }
+    // Renderizar só lê, mas métodos usados como receptor marcam a variável como suja.
+    __WK_DIRTY.with(|d| d.borrow_mut().clear());
+}
 "#;
 
-pub fn transform(code: &str, names: &BTreeSet<String>, main_name: &str) -> Result<String> {
+const RUNTIME_REGIONS: &str = r#"
+#[::wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = __wk, js_name = set)]
+    fn __wk_set(id: usize, html: &str);
+}
+
+fn __wk_escape(s: &str) -> ::std::string::String {
+    let mut out = ::std::string::String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+"#;
+
+pub fn transform(
+    code: &str,
+    names: &BTreeSet<String>,
+    main_name: &str,
+    regions: &[Region],
+) -> Result<String> {
     let stmts = Block::parse_within
         .parse_str(code)
         .map_err(|e| anyhow!("Rust inválido: {e}"))?;
@@ -71,8 +164,7 @@ pub fn transform(code: &str, names: &BTreeSet<String>, main_name: &str) -> Resul
                     exported.push(f);
                 } else {
                     let mut f = f;
-                    f.attrs
-                        .push(parse_quote!(#[::wasm_bindgen::prelude::wasm_bindgen]));
+                    f.attrs.push(parse_quote!(#[::wasm_bindgen::prelude::wasm_bindgen]));
                     hoisted.push(Item::Fn(f));
                 }
             }
@@ -109,19 +201,28 @@ pub fn transform(code: &str, names: &BTreeSet<String>, main_name: &str) -> Resul
                 }
             }
         }
-        let mut rewriter = Rewriter {
-            active,
-            used: BTreeSet::new(),
-        };
+        let mut rewriter = Rewriter::new(active);
         rewriter.visit_block_mut(&mut f.block);
         used_by_fn.push(rewriter.used);
     }
-    let promoted: BTreeSet<String> = used_by_fn.iter().flatten().cloned().collect();
 
-    let mut rewriter = Rewriter {
-        active: promoted.clone(),
-        used: BTreeSet::new(),
-    };
+    let mut region_blocks: Vec<(usize, Block, BTreeSet<String>)> = Vec::new();
+    for region in regions {
+        let mut block = region.render.clone();
+        let mut rewriter = Rewriter::new(candidates.clone());
+        rewriter.visit_block_mut(&mut block);
+        region_blocks.push((region.id, block, rewriter.used));
+    }
+
+    let promoted: BTreeSet<String> = used_by_fn
+        .iter()
+        .chain(region_blocks.iter().map(|(_, _, used)| used))
+        .flatten()
+        .cloned()
+        .collect();
+    let has_state = !promoted.is_empty() || !regions.is_empty();
+
+    let mut rewriter = Rewriter::new(promoted.clone());
     let mut main_stmts: Vec<Stmt> = Vec::new();
     let mut decl_end: BTreeMap<String, usize> = BTreeMap::new();
     for mut stmt in body {
@@ -135,22 +236,24 @@ pub fn transform(code: &str, names: &BTreeSet<String>, main_name: &str) -> Resul
         main_stmts.push(stmt);
     }
 
-    // Cada função é registrada logo após a última variável compartilhada que ela usa.
+    // Cada função e região é registrada logo após a última variável compartilhada que usa.
+    let after_decls = |used: &BTreeSet<String>| {
+        used.iter().filter_map(|v| decl_end.get(v)).max().copied().unwrap_or(0)
+    };
     let mut registrations: Vec<(usize, Stmt)> = Vec::new();
     let mut statics: Vec<TokenStream> = Vec::new();
     let mut wrappers: Vec<TokenStream> = Vec::new();
     for (f, used) in exported.iter().zip(&used_by_fn) {
-        let (registration, static_def, wrapper) = closure_parts(f, used);
-        let at = used
-            .iter()
-            .filter_map(|v| decl_end.get(v))
-            .max()
-            .copied()
-            .unwrap_or(0);
-        registrations.push((at, registration));
+        let (registration, static_def, wrapper) = closure_parts(f, used, has_state);
+        registrations.push((after_decls(used), registration));
         statics.push(static_def);
         wrappers.push(wrapper);
     }
+    for (id, block, used) in &region_blocks {
+        registrations.push((after_decls(used), region_binding(*id, block, used)));
+    }
+    registrations.sort_by_key(|(at, _)| *at);
+
     let mut final_body: Vec<Stmt> = Vec::new();
     let mut pending = registrations.into_iter().peekable();
     for (i, stmt) in main_stmts.into_iter().enumerate() {
@@ -160,16 +263,17 @@ pub fn transform(code: &str, names: &BTreeSet<String>, main_name: &str) -> Resul
         final_body.push(stmt);
     }
     final_body.extend(pending.map(|(_, reg)| reg));
+    if has_state {
+        final_body.push(parse_quote!(__wk_flush();));
+    }
 
     let main_ident = format_ident!("{main_name}");
     let attr: TokenStream = WASM_BINDGEN_ATTR.parse().unwrap();
-    let helper: TokenStream = if promoted.is_empty() {
-        quote!()
-    } else {
-        SHARED_HELPER.parse().unwrap()
-    };
+    let state: TokenStream = if has_state { RUNTIME_STATE.parse().unwrap() } else { quote!() };
+    let region_rt: TokenStream = if regions.is_empty() { quote!() } else { RUNTIME_REGIONS.parse().unwrap() };
     let tokens = quote! {
-        #helper
+        #state
+        #region_rt
         #(#hoisted)*
         #(#statics)*
         #(#wrappers)*
@@ -180,6 +284,17 @@ pub fn transform(code: &str, names: &BTreeSet<String>, main_name: &str) -> Resul
     };
     let file = syn::parse2::<syn::File>(tokens).map_err(|e| anyhow!("erro interno: {e}"))?;
     Ok(prettyplease::unparse(&file))
+}
+
+/// Registro de uma região do template: renderiza agora e quando suas variáveis mudarem.
+fn region_binding(id: usize, block: &Block, used: &BTreeSet<String>) -> Stmt {
+    let names: Vec<_> = used.iter().map(|v| format_ident!("{v}")).collect();
+    parse_quote!({
+        #(let #names = #names.clone();)*
+        __wk_bind(&[#(#names.id()),*], move || {
+            __wk_set(#id, &#block);
+        });
+    })
 }
 
 /// Funções que podem virar closures: sem genéricos, `async` ou `self`.
@@ -256,7 +371,7 @@ fn ident_of(pat: &Pat) -> syn::Ident {
 }
 
 /// Devolve (registro da closure, `thread_local!` que a guarda, wrapper exportado).
-fn closure_parts(f: &ItemFn, used: &BTreeSet<String>) -> (Stmt, TokenStream, TokenStream) {
+fn closure_parts(f: &ItemFn, used: &BTreeSet<String>, flush: bool) -> (Stmt, TokenStream, TokenStream) {
     let name = &f.sig.ident;
     let storage = format_ident!("__WK_FN_{}", name.to_string().to_uppercase());
     let attrs = &f.attrs;
@@ -281,6 +396,7 @@ fn closure_parts(f: &ItemFn, used: &BTreeSet<String>) -> (Stmt, TokenStream, Tok
     });
     let missing = format!("`{name}` chamada antes do script da página terminar de carregar");
     let attr: TokenStream = WASM_BINDGEN_ATTR.parse().unwrap();
+    let flush = if flush { quote!(__wk_flush();) } else { quote!() };
 
     let registration = parse_quote!({
         #(#clones)*
@@ -298,7 +414,9 @@ fn closure_parts(f: &ItemFn, used: &BTreeSet<String>) -> (Stmt, TokenStream, Tok
         #(#attrs)*
         #attr
         pub fn #name(#(#args: #tys),*) -> #ret {
-            #storage.with(|f| (f.borrow().as_ref().expect(#missing))(#(#args),*))
+            let __wk_result = #storage.with(|f| (f.borrow().as_ref().expect(#missing))(#(#args),*));
+            #flush
+            __wk_result
         }
     };
     (registration, static_def, wrapper)
@@ -317,13 +435,59 @@ fn bound_idents(pat: &Pat) -> Vec<String> {
     c.0
 }
 
-/// Troca usos das variáveis `active` por `(*nome.get())`, respeitando sombreamento.
+/// Troca usos das variáveis `active` por `(*nome.get())` (leitura) ou `(*nome.get_mut())`
+/// (possível escrita), respeitando sombreamento.
 struct Rewriter {
     active: BTreeSet<String>,
     used: BTreeSet<String>,
+    /// A expressão visitada é um lugar que pode ser escrito (lado esquerdo de `=`, `&mut`, receptor de método).
+    mutable: bool,
+}
+
+fn is_compound_assign(op: &syn::BinOp) -> bool {
+    use syn::BinOp::*;
+    matches!(
+        op,
+        AddAssign(_) | SubAssign(_) | MulAssign(_) | DivAssign(_) | RemAssign(_)
+            | BitXorAssign(_) | BitAndAssign(_) | BitOrAssign(_) | ShlAssign(_) | ShrAssign(_)
+    )
+}
+
+/// Identificadores capturados em strings de formatação (`"{nome}"`, `"{nome:?}"`).
+fn inline_format_args(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '{' {
+            i += 1;
+            continue;
+        }
+        if chars.get(i + 1) == Some(&'{') {
+            i += 2;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+            end += 1;
+        }
+        if end > start
+            && !chars[start].is_ascii_digit()
+            && matches!(chars.get(end), Some('}' | ':'))
+        {
+            found.push(chars[start..end].iter().collect());
+        }
+        i = end.max(i + 1);
+    }
+    found
 }
 
 impl Rewriter {
+    fn new(active: BTreeSet<String>) -> Self {
+        Self { active, used: BTreeSet::new(), mutable: false }
+    }
+
     fn scoped(&mut self, f: impl FnOnce(&mut Self)) {
         let saved = self.active.clone();
         f(self);
@@ -335,21 +499,57 @@ impl Rewriter {
             self.active.remove(&name);
         }
     }
+
+    fn visit_as(&mut self, mutable: bool, e: &mut Expr) {
+        self.mutable = mutable;
+        self.visit_expr_mut(e);
+    }
 }
 
 impl VisitMut for Rewriter {
     fn visit_expr_mut(&mut self, e: &mut Expr) {
-        if let Expr::Path(p) = e
-            && p.qself.is_none()
-            && let Some(id) = p.path.get_ident()
-            && self.active.contains(&id.to_string())
-        {
-            let id = id.clone();
-            self.used.insert(id.to_string());
-            *e = parse_quote!((*#id.get()));
-            return;
+        let mutable = std::mem::replace(&mut self.mutable, false);
+        match e {
+            Expr::Path(p)
+                if p.qself.is_none()
+                    && p.path.get_ident().is_some_and(|id| self.active.contains(&id.to_string())) =>
+            {
+                let id = p.path.get_ident().unwrap().clone();
+                self.used.insert(id.to_string());
+                *e = if mutable {
+                    parse_quote!((*#id.get_mut()))
+                } else {
+                    parse_quote!((*#id.get()))
+                };
+            }
+            Expr::Assign(a) => {
+                self.visit_as(true, &mut a.left);
+                self.visit_as(false, &mut a.right);
+            }
+            Expr::Binary(b) if is_compound_assign(&b.op) => {
+                self.visit_as(true, &mut b.left);
+                self.visit_as(false, &mut b.right);
+            }
+            Expr::Reference(r) => {
+                let is_mut = r.mutability.is_some();
+                self.visit_as(is_mut, &mut r.expr);
+            }
+            Expr::MethodCall(m) => {
+                self.visit_as(true, &mut m.receiver);
+                for arg in &mut m.args {
+                    self.visit_as(false, arg);
+                }
+            }
+            Expr::Field(f) => self.visit_as(mutable, &mut f.base),
+            Expr::Index(i) => {
+                self.visit_as(mutable, &mut i.expr);
+                self.visit_as(false, &mut i.index);
+            }
+            Expr::Paren(p) => self.visit_as(mutable, &mut p.expr),
+            Expr::Unary(u) if matches!(u.op, UnOp::Deref(_)) => self.visit_as(mutable, &mut u.expr),
+            _ => visit_mut::visit_expr_mut(self, e),
         }
-        visit_mut::visit_expr_mut(self, e);
+        self.mutable = false;
     }
 
     fn visit_block_mut(&mut self, block: &mut Block) {
@@ -429,7 +629,17 @@ impl VisitMut for Rewriter {
         let parser = Punctuated::<Expr, Token![,]>::parse_terminated;
         if let Ok(mut args) = parser.parse2(m.tokens.clone()) {
             for arg in &mut args {
-                self.visit_expr_mut(arg);
+                if let Expr::Lit(lit) = arg
+                    && let Lit::Str(s) = &lit.lit
+                {
+                    // O estado capturado em `"{nome}"` precisa ser clonado para dentro das closures.
+                    for name in inline_format_args(&s.value()) {
+                        if self.active.contains(&name) {
+                            self.used.insert(name);
+                        }
+                    }
+                }
+                self.visit_as(false, arg);
             }
             m.tokens = args.into_token_stream();
         }
@@ -441,8 +651,13 @@ mod tests {
     use super::*;
 
     fn run(code: &str, names: &[&str]) -> String {
+        run_with(code, names, "")
+    }
+
+    fn run_with(code: &str, names: &[&str], html: &str) -> String {
         let names = names.iter().map(|s| s.to_string()).collect();
-        let out = transform(code, &names, "__wk_main_t").unwrap();
+        let template = crate::template::compile(html).unwrap();
+        let out = transform(code, &names, "__wk_main_t", &template.regions).unwrap();
         syn::parse_file(&out).unwrap();
         out
     }
@@ -454,8 +669,8 @@ mod tests {
             &["inc"],
         );
         assert!(out.contains("let count = __WkShared::new(0);"));
-        assert!(out.contains("(*count.get()) += 1;"));
-        assert!(out.contains("(*count.get()) += 10;"));
+        assert!(out.contains("(*count.get_mut()) += 1;"));
+        assert!(out.contains("(*count.get_mut()) += 10;"));
         assert!(out.contains("let unused = 1;"));
         assert!(out.contains("pub fn inc()"));
         assert!(out.contains("pub fn __wk_main_t()"));
@@ -481,5 +696,44 @@ mod tests {
         let out = run("extern \"js\" { fn alert(s: &str); }\nalert(\"a\");", &[]);
         assert!(out.contains("extern \"C\""));
         assert!(out.find("extern \"C\"").unwrap() < out.find("pub fn __wk_main_t").unwrap());
+    }
+
+    #[test]
+    fn writes_use_get_mut_and_reads_use_get() {
+        let out = run(
+            "let mut v = vec![1];\nlet mut n = 0;\npub fn f() { v.push(n); n = n + 1; let _ = v.len(); }",
+            &["f"],
+        );
+        assert!(out.contains("(*v.get_mut()).push((*n.get()));"));
+        assert!(out.contains("(*n.get_mut()) = (*n.get()) + 1;"));
+    }
+
+    #[test]
+    fn inline_format_args_count_as_uses() {
+        let out = run("let a = 1;\nlet b = 2;\npub fn f() { println!(\"{a} {b:?}\"); }", &["f"]);
+        assert!(out.contains("let a = a.clone();"));
+        assert!(out.contains("let b = b.clone();"));
+    }
+
+    #[test]
+    fn regions_become_bindings_subscribed_to_their_variables() {
+        let out = run_with(
+            "let mut n = 0;\nlet other = 1;\npub fn inc() { n += 1; }",
+            &["inc"],
+            "<p>{n}</p>{#each [1, 2].iter() as x}{x}{/each}",
+        );
+        let flat: String = out.split_whitespace().collect();
+        assert!(flat.contains("&[n.id()]"));
+        assert!(flat.contains("&[],"));
+        assert!(flat.contains("__wk_set(0usize"));
+        assert!(flat.contains("__wk_set(1usize"));
+        assert!(out.contains("let other = 1;"));
+        assert!(out.contains("__wk_flush();"));
+    }
+
+    #[test]
+    fn template_loop_variables_shadow_state() {
+        let out = run_with("let item = 1;", &[], "{#each [1].iter() as item}{item}{/each}");
+        assert!(!out.contains("__WkShared::new"));
     }
 }

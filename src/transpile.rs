@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::{loader, parser, rust, script};
+use crate::{loader, parser, rust, script, template};
 
 const IGNORED_DIRS: [&str; 3] = ["target", "dist", ".git"];
 
@@ -48,14 +48,23 @@ pub fn transpile_project(root: &Path, dest: &Path, glue_name: &str) -> Result<Ve
                 handlers.extend(parsed.handlers.iter().cloned());
 
                 let path = file.strip_prefix(&src)?.with_extension("html");
-                let main_fn = parsed.rust.as_ref().map(|_| main_fn_name(&path));
-                if let (Some(code), Some(main_fn)) = (&parsed.rust, &main_fn) {
-                    let code = script::transform(code, &parsed.handlers, main_fn)
-                        .with_context(|| format!("em {}", file.display()))?;
+                let template = template::compile(&parsed.html)
+                    .with_context(|| format!("em {}", file.display()))?;
+                let has_regions = !template.regions.is_empty();
+                let main_fn = (parsed.rust.is_some() || has_regions).then(|| main_fn_name(&path));
+                if let Some(main_fn) = &main_fn {
+                    let code = script::transform(
+                        parsed.rust.as_deref().unwrap_or_default(),
+                        &parsed.handlers,
+                        main_fn,
+                        &template.regions,
+                    )
+                    .with_context(|| format!("em {}", file.display()))?;
                     write_rs(&file, &code)?;
                 }
                 fs::remove_file(&file)?;
-                let html = loader::render_page(&parsed.html, &path, glue_name, main_fn.as_deref());
+                let html =
+                    loader::render_page(&template.html, &path, glue_name, main_fn.as_deref(), has_regions);
                 pages.push(Page { path, html });
             }
             FileKind::RustOnly => rust_only.push(file),
