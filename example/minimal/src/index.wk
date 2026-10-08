@@ -1,0 +1,13 @@
+<script lang="rs">
+	extern "js" {
+		pub fn alert(s: &str);
+	}
+
+	pub fn happy(text: &str) {
+		alert(&format!("Happy: {}", text));
+	}
+</script>
+
+<h1>Cool page</h1>
+<label for="happy-input">click the button to see a happy message</label>
+<button onclick="happy('Have a great day!')">Happy</button>
