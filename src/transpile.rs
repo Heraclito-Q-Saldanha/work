@@ -46,7 +46,7 @@ pub fn transpile_project(root: &Path, dest: &Path, glue_name: &str) -> Result<Ve
         }
         fs::remove_file(&wk)?;
         let path = wk.strip_prefix(&src)?.with_extension("html");
-        let html = loader::inject(&parsed.html, &path, glue_name);
+        let html = loader::render_page(&parsed.html, &path, glue_name);
         pages.push(Page { path, html });
     }
     Ok(pages)

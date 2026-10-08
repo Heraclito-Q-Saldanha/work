@@ -1,8 +1,9 @@
 use std::path::Path;
 
-/// Insere no HTML um módulo que carrega o glue do wasm e expõe as exportações em `window`,
-/// para que atributos como `onclick="foo()"` as enxerguem.
-pub fn inject(html: &str, page: &Path, glue_name: &str) -> String {
+/// Monta o documento HTML mínimo com `body` dentro de `<body>`, mais um módulo que carrega
+/// o glue do wasm e expõe as exportações em `window`, para que atributos como
+/// `onclick="foo()"` as enxerguem.
+pub fn render_page(body: &str, page: &Path, glue_name: &str) -> String {
     let depth = page.components().count().saturating_sub(1);
     let prefix = if depth == 0 { "./".to_string() } else { "../".repeat(depth) };
     let script = format!(
@@ -12,10 +13,30 @@ pub fn inject(html: &str, page: &Path, glue_name: &str) -> String {
          for (const [k, v] of Object.entries(wasm)) {{\n  \
            if (k !== \"default\" && k !== \"initSync\") window[k] = v;\n\
          }}\n\
-         </script>\n"
+         </script>"
     );
-    match html.to_ascii_lowercase().rfind("</body>") {
-        Some(at) => format!("{}{script}{}", &html[..at], &html[at..]),
-        None => format!("{html}{script}"),
+    let content = indent(body.trim());
+    let script = indent(&script);
+    let content = if content.is_empty() { script } else { format!("{content}\n{script}") };
+    format!("<!DOCTYPE html>\n<html>\n  <head></head>\n  <body>\n{content}\n  </body>\n</html>\n")
+}
+
+fn indent(text: &str) -> String {
+    text.lines()
+        .map(|l| if l.trim().is_empty() { String::new() } else { format!("    {l}") })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wraps_fragment_in_document() {
+        let out = render_page("<p>fuu</p>\n", Path::new("a/b.html"), "app");
+        assert!(out.starts_with("<!DOCTYPE html>\n<html>\n  <head></head>\n  <body>\n    <p>fuu</p>\n"));
+        assert!(out.contains("\"../app.js\""));
+        assert!(out.ends_with("  </body>\n</html>\n"));
     }
 }

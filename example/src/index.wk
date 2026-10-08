@@ -1,14 +1,9 @@
-<!DOCTYPE html>
-<html>
-  <head><title>Example</title></head>
-  <body>
-    <script lang="rs">
-      pub fn add(a: i32, b: i32) -> i32 {
-          a + b
-      }
-    </script>
-    <h1>Hello from .wk</h1>
-    <button onclick="alert(add(1, 2))">1 + 2</button>
-    <a href="about/index.html">About</a>
-  </body>
-</html>
+<script lang="rs">
+  pub fn add(a: i32, b: i32) -> i32 {
+      a + b
+  }
+</script>
+
+<h1>Hello from .wk</h1>
+<button onclick="alert(add(1, 2))">1 + 2</button>
+<a href="about/index.html">About</a>
