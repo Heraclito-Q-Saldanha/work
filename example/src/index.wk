@@ -1,7 +1,5 @@
 <script lang="rs">
-  extern "js" {
-      fn alert(s: &str);
-  }
+  use crate::util::*;
 
   pub fn greet(a: i32, b: i32) {
       alert(&format!("{a} + {b} = {}", a + b));

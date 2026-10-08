@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -16,40 +17,93 @@ pub struct Page {
     pub html: String,
 }
 
-/// Copia o projeto para `dest`, converte cada `.wk` em `.rs` (se houver Rust)
-/// e devolve as páginas HTML geradas, já carregando o glue `glue_name`.js.
+/// Copia o projeto para `dest` e processa os arquivos especiais de `src/`:
+/// - `foo.wk` vira `foo.html` e, se houver `<script lang="rs">`, `foo.rs`;
+/// - `foo.wk.rs` vira apenas `foo.rs`, sem página HTML.
+///
+/// Devolve as páginas HTML geradas, já carregando o glue `glue_name`.js.
 pub fn transpile_project(root: &Path, dest: &Path, glue_name: &str) -> Result<Vec<Page>> {
     copy_project(root, dest)?;
 
     let src = dest.join("src");
-    let wk_files: Vec<PathBuf> = WalkDir::new(&src)
+    let files: Vec<PathBuf> = WalkDir::new(&src)
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "wk"))
+        .filter(|e| e.file_type().is_file())
         .map(DirEntry::into_path)
         .collect();
 
     let mut pages = Vec::new();
-    for wk in wk_files {
-        let source = fs::read_to_string(&wk).with_context(|| format!("lendo {}", wk.display()))?;
-        let parsed = parser::parse(&source).with_context(|| format!("em {}", wk.display()))?;
+    let mut handlers = BTreeSet::new();
+    let mut rust_only = Vec::new();
 
-        if let Some(code) = parsed.rust {
-            let code = rust::transform(&code, &parsed.handlers)
-                .with_context(|| format!("em {}", wk.display()))?;
-            let rs = wk.with_extension("rs");
-            if rs.exists() {
-                bail!("{} conflita com {}", rs.display(), wk.display());
+    for file in files {
+        match FileKind::of(&file) {
+            FileKind::Page => {
+                let source = fs::read_to_string(&file)
+                    .with_context(|| format!("lendo {}", file.display()))?;
+                let parsed =
+                    parser::parse(&source).with_context(|| format!("em {}", file.display()))?;
+                handlers.extend(parsed.handlers.iter().cloned());
+
+                if let Some(code) = &parsed.rust {
+                    let code = rust::transform(code, &parsed.handlers)
+                        .with_context(|| format!("em {}", file.display()))?;
+                    write_rs(&file, &code)?;
+                }
+                fs::remove_file(&file)?;
+                let path = file.strip_prefix(&src)?.with_extension("html");
+                let html = loader::render_page(&parsed.html, &path, glue_name);
+                pages.push(Page { path, html });
             }
-            fs::write(&rs, code)?;
+            FileKind::RustOnly => rust_only.push(file),
+            FileKind::Other => {}
         }
-        fs::remove_file(&wk)?;
-        let path = wk.strip_prefix(&src)?.with_extension("html");
-        let html = loader::render_page(&parsed.html, &path, glue_name);
-        pages.push(Page { path, html });
+    }
+
+    // Os `.wk.rs` não têm HTML próprio: expõem as funções chamadas por qualquer página.
+    for file in rust_only {
+        let code = fs::read_to_string(&file).with_context(|| format!("lendo {}", file.display()))?;
+        let code =
+            rust::transform(&code, &handlers).with_context(|| format!("em {}", file.display()))?;
+        write_rs(&file, &code)?;
+        fs::remove_file(&file)?;
     }
     Ok(pages)
+}
+
+enum FileKind {
+    Page,
+    RustOnly,
+    Other,
+}
+
+impl FileKind {
+    fn of(path: &Path) -> Self {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if name.ends_with(".wk.rs") {
+            Self::RustOnly
+        } else if name.ends_with(".wk") {
+            Self::Page
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Escreve `code` em `foo.rs`, ao lado de `foo.wk` ou `foo.wk.rs`.
+fn write_rs(origin: &Path, code: &str) -> Result<()> {
+    let mut stem = origin.with_extension("");
+    if stem.extension().is_some_and(|e| e == "wk") {
+        stem.set_extension("");
+    }
+    let rs = stem.with_extension("rs");
+    if rs.exists() {
+        bail!("{} conflita com {}", rs.display(), origin.display());
+    }
+    fs::write(rs, code)?;
+    Ok(())
 }
 
 fn copy_project(root: &Path, dest: &Path) -> Result<()> {
