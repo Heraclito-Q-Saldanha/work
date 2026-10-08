@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::parser;
+use crate::{loader, parser, rust};
 
 const IGNORED_DIRS: [&str; 3] = ["target", "dist", ".git"];
 
@@ -17,8 +17,8 @@ pub struct Page {
 }
 
 /// Copia o projeto para `dest`, converte cada `.wk` em `.rs` (se houver Rust)
-/// e devolve as páginas HTML geradas.
-pub fn transpile_project(root: &Path, dest: &Path) -> Result<Vec<Page>> {
+/// e devolve as páginas HTML geradas, já carregando o glue `glue_name`.js.
+pub fn transpile_project(root: &Path, dest: &Path, glue_name: &str) -> Result<Vec<Page>> {
     copy_project(root, dest)?;
 
     let src = dest.join("src");
@@ -35,18 +35,19 @@ pub fn transpile_project(root: &Path, dest: &Path) -> Result<Vec<Page>> {
         let source = fs::read_to_string(&wk).with_context(|| format!("lendo {}", wk.display()))?;
         let parsed = parser::parse(&source).with_context(|| format!("em {}", wk.display()))?;
 
-        if let Some(rust) = parsed.rust {
+        if let Some(code) = parsed.rust {
+            let code = rust::export_functions(&code, &parsed.handlers)
+                .with_context(|| format!("em {}", wk.display()))?;
             let rs = wk.with_extension("rs");
             if rs.exists() {
                 bail!("{} conflita com {}", rs.display(), wk.display());
             }
-            fs::write(&rs, rust)?;
+            fs::write(&rs, code)?;
         }
         fs::remove_file(&wk)?;
-        pages.push(Page {
-            path: wk.strip_prefix(&src)?.with_extension("html"),
-            html: parsed.html,
-        });
+        let path = wk.strip_prefix(&src)?.with_extension("html");
+        let html = loader::inject(&parsed.html, &path, glue_name);
+        pages.push(Page { path, html });
     }
     Ok(pages)
 }

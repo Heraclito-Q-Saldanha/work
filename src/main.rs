@@ -1,5 +1,8 @@
 mod builder;
+mod loader;
+mod manifest;
 mod parser;
+mod rust;
 mod transpile;
 
 use anyhow::{Context, Result, bail};
@@ -40,7 +43,9 @@ fn build() -> Result<()> {
     }
 
     let tmp = tempfile::tempdir()?;
-    let pages = transpile::transpile_project(&root, tmp.path())?;
+    let name = manifest::lib_name(&root)?;
+    let pages = transpile::transpile_project(&root, tmp.path(), &name)?;
+    manifest::ensure_wasm_bindgen(tmp.path())?;
     let wasm = builder::compile_wasm(tmp.path(), &root.join("target/wk"))
         .context("compilando projeto")?;
 

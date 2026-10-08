@@ -9,6 +9,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::transpile::Page;
 
+/// Deve ser igual à versão de `wasm-bindgen-cli-support` no Cargo.toml.
+pub const WASM_BINDGEN_VERSION: &str = "0.2.129";
 const TARGET: &str = "wasm32-unknown-unknown";
 
 /// Compila o projeto em `project` para wasm e devolve o caminho do `.wasm` gerado.
@@ -43,13 +45,19 @@ pub fn compile_wasm(project: &Path, target_dir: &Path) -> Result<PathBuf> {
     wasm.context("cargo não produziu um .wasm (o projeto precisa de um src/lib.rs)")
 }
 
-/// Recria `dist` com o `.wasm` e as páginas HTML, preservando a estrutura de `src/`.
+/// Recria `dist` com o wasm, o glue JS do wasm-bindgen e as páginas HTML,
+/// preservando a estrutura de `src/`.
 pub fn package(dist: &Path, wasm: &Path, pages: &[Page]) -> Result<()> {
     if dist.exists() {
         fs::remove_dir_all(dist)?;
     }
     fs::create_dir_all(dist)?;
-    fs::copy(wasm, dist.join(wasm.file_name().context("wasm sem nome")?))?;
+    wasm_bindgen_cli_support::Bindgen::new()
+        .input_path(wasm)
+        .web(true)?
+        .typescript(false)
+        .generate(dist)
+        .map_err(|e| anyhow::anyhow!("wasm-bindgen falhou: {e}"))?;
     for page in pages {
         let out = dist.join(&page.path);
         fs::create_dir_all(out.parent().unwrap())?;
