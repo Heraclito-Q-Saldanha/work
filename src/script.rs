@@ -70,6 +70,11 @@ impl<T> __WkShared<T> {
         unsafe { &mut *self.cell.get() }
     }
 
+    // Leitura de variável imutável: o rustc rejeita escritas através do `&T`.
+    fn get_ref(&self) -> &T {
+        unsafe { &*self.cell.get() }
+    }
+
     // Possível escrita: marca a variável como suja.
     #[allow(clippy::mut_from_ref)]
     fn get_mut(&self) -> &mut T {
@@ -308,6 +313,31 @@ pub fn transform(
         .filter(|n| declared[n] == 1)
         .collect();
 
+    // Variáveis sem `mut` (e as derivadas) não podem ser alteradas pelo script.
+    let immutable: BTreeSet<String> = body
+        .iter()
+        .filter(|s| simple_decl(s).is_some_and(|n| candidates.contains(&n)))
+        .filter_map(|s| match s {
+            Stmt::Local(l) => Some(l),
+            _ => None,
+        })
+        .filter_map(|l| {
+            let pat = match &l.pat {
+                Pat::Type(t) => &*t.pat,
+                p => p,
+            };
+            match pat {
+                Pat::Ident(PatIdent {
+                    ident,
+                    mutability: None,
+                    ..
+                }) => Some(ident.to_string()),
+                _ => None,
+            }
+        })
+        .chain(derived_names.iter().cloned())
+        .collect();
+
     let mut used_by_fn: Vec<BTreeSet<String>> = Vec::new();
     for f in &mut exported {
         let mut active = candidates.clone();
@@ -318,7 +348,7 @@ pub fn transform(
                 }
             }
         }
-        let mut rewriter = Rewriter::new(active);
+        let mut rewriter = Rewriter::new(active, &immutable);
         rewriter.visit_block_mut(&mut f.block);
         used_by_fn.push(rewriter.used);
     }
@@ -337,7 +367,7 @@ pub fn transform(
     }
     let mut region_blocks: Vec<(Block, BTreeSet<String>)> = Vec::new();
     for mut block in updates {
-        let mut rewriter = Rewriter::new(candidates.clone());
+        let mut rewriter = Rewriter::new(candidates.clone(), &immutable);
         rewriter.visit_block_mut(&mut block);
         region_blocks.push((block, rewriter.used));
     }
@@ -353,7 +383,7 @@ pub fn transform(
             && derived_names.contains(&name)
         {
             let mut expr = (*init.expr).clone();
-            let mut rewriter = Rewriter::new(candidates.clone());
+            let mut rewriter = Rewriter::new(candidates.clone(), &immutable);
             rewriter.visit_expr_mut(&mut expr);
             if rewriter.used.contains(&name) {
                 return Err(anyhow!("`{name}` depende de si mesma em `derived!`"));
@@ -364,7 +394,7 @@ pub fn transform(
     let mut effect_regs: BTreeMap<usize, (Expr, BTreeSet<String>)> = BTreeMap::new();
     for (i, expr) in &effect_exprs {
         let mut expr = expr.clone();
-        let mut rewriter = Rewriter::new(candidates.clone());
+        let mut rewriter = Rewriter::new(candidates.clone(), &immutable);
         rewriter.visit_expr_mut(&mut expr);
         effect_regs.insert(*i, (expr, rewriter.used));
     }
@@ -381,7 +411,7 @@ pub fn transform(
     let has_dom = !regions.is_empty() || !binds.is_empty();
     let has_state = !promoted.is_empty() || has_dom || !effect_regs.is_empty();
 
-    let mut rewriter = Rewriter::new(promoted.clone());
+    let mut rewriter = Rewriter::new(promoted.clone(), &immutable);
     let mut main_stmts: Vec<Stmt> = Vec::new();
     let mut decl_end: BTreeMap<String, usize> = BTreeMap::new();
     let mut registrations: Vec<(usize, Stmt)> = Vec::new();
@@ -689,6 +719,8 @@ fn bound_idents(pat: &Pat) -> Vec<String> {
 /// (possível escrita), respeitando sombreamento.
 struct Rewriter {
     active: BTreeSet<String>,
+    /// Variáveis declaradas sem `mut`: nunca passam por `get_mut`.
+    immutable: BTreeSet<String>,
     used: BTreeSet<String>,
     /// A expressão visitada é um lugar que pode ser escrito (lado esquerdo de `=`, `&mut`, receptor de método).
     mutable: bool,
@@ -742,9 +774,10 @@ fn inline_format_args(s: &str) -> Vec<String> {
 }
 
 impl Rewriter {
-    fn new(active: BTreeSet<String>) -> Self {
+    fn new(active: BTreeSet<String>, immutable: &BTreeSet<String>) -> Self {
         Self {
             active,
+            immutable: immutable.clone(),
             used: BTreeSet::new(),
             mutable: false,
         }
@@ -780,7 +813,9 @@ impl VisitMut for Rewriter {
             {
                 let id = p.path.get_ident().unwrap().clone();
                 self.used.insert(id.to_string());
-                *e = if mutable {
+                *e = if self.immutable.contains(&id.to_string()) {
+                    parse_quote!((*#id.get_ref()))
+                } else if mutable {
                     parse_quote!((*#id.get_mut()))
                 } else {
                     parse_quote!((*#id.get()))
@@ -953,13 +988,13 @@ mod tests {
             "let n = 1;\npub fn a(n: i32) -> i32 { n }\npub fn b() -> i32 { let n = 2; n }\npub fn c() -> i32 { n }",
             &["a", "b", "c"],
         );
-        assert_eq!(out.matches("(*n.get())").count(), 1);
+        assert_eq!(out.matches("(*n.get_ref())").count(), 1);
     }
 
     #[test]
     fn rewrites_macro_arguments() {
         let out = run("let x = 1;\npub fn f() { println!(\"{}\", x); }", &["f"]);
-        assert!(out.contains("(* x.get())"));
+        assert!(out.contains("(* x.get_ref())"));
     }
 
     #[test]
@@ -1041,5 +1076,28 @@ mod reactive_tests {
     #[test]
     fn self_reference_is_rejected() {
         assert!(run("let a = derived!(a + 1);", "").is_err());
+    }
+}
+
+#[cfg(test)]
+mod immutability_tests {
+    use super::*;
+
+    fn run(code: &str) -> String {
+        transform(code, &["f".to_string()].into(), "__wk_main_t", &[], &[]).unwrap()
+    }
+
+    #[test]
+    fn immutable_variables_never_use_get_mut() {
+        let out = run("let n = 1; let mut m = 1; pub fn f() { m += n; }");
+        assert!(out.contains("(*m.get_mut())"));
+        assert!(out.contains("(*n.get_ref())"));
+        assert!(!out.contains("n.get_mut"));
+    }
+
+    #[test]
+    fn writing_an_immutable_variable_is_left_to_rustc_to_reject() {
+        let out = run("let n = 1; pub fn f() { n += 1; }");
+        assert!(out.contains("(*n.get_ref()) += 1"));
     }
 }
