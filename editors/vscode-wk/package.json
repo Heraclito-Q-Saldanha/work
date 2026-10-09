@@ -2,7 +2,7 @@
   "name": "wk-syntax",
   "displayName": "WK Syntax",
   "description": "Syntax highlighting for WK files with embedded Rust.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "work",
   "engines": {
     "vscode": "^1.80.0"
@@ -33,7 +33,8 @@
         "scopeName": "source.wk",
         "path": "./syntaxes/wk.tmLanguage.json",
         "embeddedLanguages": {
-          "source.rust": "rust"
+          "source.rust": "rust",
+          "source.js": "javascript"
         }
       }
     ]

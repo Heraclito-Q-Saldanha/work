@@ -16,7 +16,7 @@ Para empacotar e instalar a extensão, execute da raiz do repositório:
 ```sh
 cd editors/vscode-wk
 npx --yes @vscode/vsce package
-code --install-extension wk-syntax-0.1.0.vsix
+code --install-extension wk-syntax-0.2.0.vsix
 ```
 
 ## Exemples
