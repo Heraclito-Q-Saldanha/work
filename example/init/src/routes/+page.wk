@@ -1,4 +1,6 @@
 <script lang="rs">
+	use crate::components::Counter;
+
 	extern "js" {
 		#[wasm_bindgen(js_namespace = console)]
 		fn log(s: &str);
@@ -41,10 +43,13 @@
 	<p>No clicks yet</p>
 {/if}
 
-<ul>
-	{#each items as item, i}
-		<li>{i + 1}. {item}</li>
-	{/each}
-</ul>
+<h2>Counters</h2>
+
+<Counter label="fixed" />
+
+{#each items as item, i by i}
+	<Counter label={item} />
+{/each}
+
 
 <a href="/about">About</a>

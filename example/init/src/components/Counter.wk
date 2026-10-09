@@ -1,0 +1,16 @@
+<script lang="rs">
+	let label: String = prop!();
+	let mut count = 0;
+	let mut note = String::new();
+
+	pub fn inc() {
+		count += 1;
+	}
+</script>
+
+<div>
+	<strong>{label}</strong>: {count}
+	<button onclick="inc()">+1</button>
+	<input bind:value={note} placeholder="note">
+	<em>{note}</em>
+</div>

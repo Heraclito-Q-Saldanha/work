@@ -10,7 +10,6 @@ pub fn render_page(
     page: &Path,
     glue_name: &str,
     main_fn: Option<&str>,
-    dynamic: bool,
     binds: &[Bind],
 ) -> String {
     let depth = page.components().count().saturating_sub(1);
@@ -33,15 +32,15 @@ pub fn render_page(
             serde_json::Value::Array(list)
         ));
     }
-    let region_runtime = if dynamic { REGION_RUNTIME } else { "" };
     let script = format!(
         "<script type=\"module\">\n\
-         {region_runtime}\
+         {REGION_RUNTIME}\
          import init, * as wasm from \"{prefix}{glue_name}.js\";\n\
          await init({{ module_or_path: new URL(\"{prefix}{glue_name}_bg.wasm\", import.meta.url) }});\n\
          for (const [k, v] of Object.entries(wasm)) {{\n  \
            if (k !== \"default\" && k !== \"initSync\" && !k.startsWith(\"__wk_\")) window[k] = v;\n\
          }}\n\
+         window.__wk.wasm = wasm;\n\
          {run_main}\
          </script>"
     );
@@ -55,31 +54,64 @@ pub fn render_page(
     format!("<!DOCTYPE html>\n<html>\n  <head></head>\n  <body>\n{content}\n  </body>\n</html>\n")
 }
 
-/// Ponte usada pelo wasm para atualizar o conteúdo entre os comentários `<!--wk:N-->` e `<!--/wk:N-->`.
+/// Ponte usada pelo wasm: atualiza o conteúdo entre os comentários `<!--wk:N-->` e
+/// `<!--/wk:N-->`, propriedades de elementos ligados por `bind:` e despacha chamadas de
+/// atributos de evento dos componentes (`__wk.c(id).nome(...)`).
 const REGION_RUNTIME: &str = "\
 window.__wk = {
-  start: null, end: null, last: new Map(),
-  set(id, html) {
-    if (this.last.get(id) === html) return;
-    this.last.set(id, html);
-    if (!this.start) {
-      this.start = new Map();
-      this.end = new Map();
+  wasm: null, start: new Map(), end: new Map(), last: new WeakMap(),
+  find(id) {
+    const live = (n) => n && n.isConnected;
+    if (!live(this.start.get(id)) || !live(this.end.get(id))) {
+      this.start.clear();
+      this.end.clear();
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_COMMENT);
       for (let n; (n = walker.nextNode());) {
         if (n.data.startsWith('wk:')) this.start.set(+n.data.slice(3), n);
         else if (n.data.startsWith('/wk:')) this.end.set(+n.data.slice(4), n);
       }
     }
+    const start = this.start.get(id), end = this.end.get(id);
+    return start && end ? [start, end] : null;
+  },
+  set(id, html) {
+    const found = this.find(id);
+    if (!found) return;
+    const [start, end] = found;
+    if (this.last.get(start) === html) return;
+    this.last.set(start, html);
     const range = document.createRange();
-    range.setStartAfter(this.start.get(id));
-    range.setEndBefore(this.end.get(id));
+    range.setStartAfter(start);
+    range.setEndBefore(end);
     range.deleteContents();
-    range.insertNode(range.createContextualFragment(html));
+    const fragment = range.createContextualFragment(html);
+    const inits = this.hook(fragment);
+    range.insertNode(fragment);
+    for (const [instance, init] of inits) this.wasm.__wk_init(instance, init);
   },
   set_prop(id, prop, value) {
     const el = document.querySelector(`[data-wk-b${id}]`);
     if (el && el[prop] !== value) el[prop] = value;
+  },
+  c(instance) {
+    return new Proxy({}, {
+      get: (_, name) => (...args) => this.wasm.__wk_call(instance, name, args),
+    });
+  },
+  // Liga os `bind:` dos componentes (`data-wk-bN=\"instância|N|propriedade|evento\"`) e devolve
+  // as funções que levam o valor inicial da variável ao elemento, depois de inserido.
+  hook(root) {
+    const inits = [];
+    for (const el of root.querySelectorAll('*')) {
+      for (const attr of el.attributes) {
+        if (!attr.name.startsWith('data-wk-b') || !attr.value) continue;
+        const [instance, n, prop, event] = attr.value.split('|');
+        el.addEventListener(event, () =>
+          this.wasm.__wk_call(+instance, `__wk_bind_${n}`, [el[prop]]));
+        inits.push([+instance, `__wk_init_${n}`]);
+      }
+    }
+    return inits;
   },
 };
 ";
@@ -108,7 +140,6 @@ mod tests {
             Path::new("a/b.html"),
             "app",
             Some("__wk_main_a__b"),
-            false,
             &[],
         );
         assert!(

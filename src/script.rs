@@ -27,196 +27,16 @@ use syn::{
 
 use crate::{
     rust::WASM_BINDGEN_ATTR,
-    template::{Bind, Region},
+    template::{Bind, Part, Region, Template, text_tokens},
 };
 
-const RUNTIME_STATE: &str = r#"
-thread_local! {
-    static __WK_NEXT_ID: ::std::cell::Cell<usize> = ::std::cell::Cell::new(0);
-    static __WK_DIRTY: ::std::cell::RefCell<::std::vec::Vec<usize>> =
-        ::std::cell::RefCell::new(::std::vec::Vec::new());
-    static __WK_DERIVED: ::std::cell::RefCell<::std::vec::Vec<usize>> =
-        ::std::cell::RefCell::new(::std::vec::Vec::new());
-    static __WK_BINDINGS: ::std::cell::RefCell<::std::vec::Vec<(::std::vec::Vec<usize>, ::std::rc::Rc<dyn Fn()>)>> =
-        ::std::cell::RefCell::new(::std::vec::Vec::new());
+/// Onde o código traduzido vai viver.
+enum Mode<'a> {
+    /// Página: o script vira a função exportada `main_name`.
+    Page(&'a str),
+    /// Componente: o script vira `__wk_create`, que cria uma instância com estado próprio.
+    Component(&'a [Part]),
 }
-
-// Estado compartilhado entre as funções do script. O wasm roda em uma única thread, então
-// o acesso sem checagem de empréstimo é aceitável aqui.
-#[allow(dead_code)]
-struct __WkShared<T> {
-    id: usize,
-    cell: ::std::rc::Rc<::std::cell::UnsafeCell<T>>,
-}
-
-#[allow(dead_code)]
-impl<T> __WkShared<T> {
-    fn new(value: T) -> Self {
-        let id = __WK_NEXT_ID.with(|n| {
-            let id = n.get();
-            n.set(id + 1);
-            id
-        });
-        Self { id, cell: ::std::rc::Rc::new(::std::cell::UnsafeCell::new(value)) }
-    }
-
-    fn id(&self) -> usize {
-        self.id
-    }
-
-    // Leitura.
-    #[allow(clippy::mut_from_ref)]
-    fn get(&self) -> &mut T {
-        unsafe { &mut *self.cell.get() }
-    }
-
-    // Leitura de variável imutável: o rustc rejeita escritas através do `&T`.
-    fn get_ref(&self) -> &T {
-        unsafe { &*self.cell.get() }
-    }
-
-    // Possível escrita: marca a variável como suja.
-    #[allow(clippy::mut_from_ref)]
-    fn get_mut(&self) -> &mut T {
-        __WK_DIRTY.with(|d| d.borrow_mut().push(self.id));
-        self.get()
-    }
-}
-
-impl<T> Clone for __WkShared<T> {
-    fn clone(&self) -> Self {
-        Self { id: self.id, cell: self.cell.clone() }
-    }
-}
-
-impl<T: ::std::fmt::Display> ::std::fmt::Display for __WkShared<T> {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        ::std::fmt::Display::fmt(self.get(), f)
-    }
-}
-
-impl<T: ::std::fmt::Debug> ::std::fmt::Debug for __WkShared<T> {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        ::std::fmt::Debug::fmt(self.get(), f)
-    }
-}
-
-// Renderiza uma vez e reexecuta quando alguma variável em `deps` for escrita.
-#[allow(dead_code)]
-fn __wk_bind(deps: &[usize], render: impl Fn() + 'static) {
-    let pending = __WK_DIRTY.with(|d| d.borrow().len());
-    render();
-    __WK_DIRTY.with(|d| d.borrow_mut().truncate(pending));
-    __WK_BINDINGS.with(|b| b.borrow_mut().push((deps.to_vec(), ::std::rc::Rc::new(render))));
-}
-
-// Atualiza uma variável derivada; só propaga se o valor mudou.
-#[allow(dead_code)]
-fn __wk_set_derived<T: PartialEq>(slot: &__WkShared<T>, value: T) {
-    if *slot.get() != value {
-        *slot.get() = value;
-        __WK_DERIVED.with(|d| d.borrow_mut().push(slot.id));
-    }
-}
-
-#[allow(dead_code)]
-fn __wk_flush() {
-    // Cada passada pode alterar variáveis derivadas, que sujam as bindings seguintes.
-    for _ in 0..100 {
-        let dirty = __WK_DIRTY.with(|d| ::std::mem::take(&mut *d.borrow_mut()));
-        if dirty.is_empty() {
-            return;
-        }
-        let stale: ::std::vec::Vec<::std::rc::Rc<dyn Fn()>> = __WK_BINDINGS.with(|b| {
-            b.borrow()
-                .iter()
-                .filter(|(deps, _)| deps.iter().any(|d| dirty.contains(d)))
-                .map(|(_, f)| f.clone())
-                .collect()
-        });
-        for render in stale {
-            render();
-        }
-        // Renderizar só lê, mas métodos usados como receptor marcam a variável como suja.
-        let changed = __WK_DERIVED.with(|d| ::std::mem::take(&mut *d.borrow_mut()));
-        __WK_DIRTY.with(|d| *d.borrow_mut() = changed);
-    }
-    ::std::panic!("ciclo entre variáveis derived!/effect!");
-}
-"#;
-
-const RUNTIME_REGIONS: &str = r#"
-#[::wasm_bindgen::prelude::wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = __wk, js_name = set)]
-    fn __wk_set(id: usize, html: &str);
-}
-
-fn __wk_escape(s: &str) -> ::std::string::String {
-    let mut out = ::std::string::String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-"#;
-
-const RUNTIME_BINDS: &str = r#"
-#[::wasm_bindgen::prelude::wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = __wk, js_name = set_prop)]
-    fn __wk_set_prop(id: usize, prop: &str, value: &::wasm_bindgen::JsValue);
-}
-
-// Converte o valor de uma propriedade do DOM no tipo da variável ligada.
-#[allow(dead_code)]
-trait __WkFromJs: Sized {
-    fn from_js(v: &::wasm_bindgen::JsValue) -> ::std::option::Option<Self>;
-}
-
-impl __WkFromJs for ::std::string::String {
-    fn from_js(v: &::wasm_bindgen::JsValue) -> ::std::option::Option<Self> {
-        v.as_string()
-    }
-}
-
-impl __WkFromJs for bool {
-    fn from_js(v: &::wasm_bindgen::JsValue) -> ::std::option::Option<Self> {
-        v.as_bool()
-    }
-}
-
-impl<T: __WkFromJs> __WkFromJs for ::std::option::Option<T> {
-    fn from_js(v: &::wasm_bindgen::JsValue) -> ::std::option::Option<Self> {
-        if v.is_null() || v.is_undefined() {
-            ::std::option::Option::Some(::std::option::Option::None)
-        } else {
-            T::from_js(v).map(::std::option::Option::Some)
-        }
-    }
-}
-
-macro_rules! __wk_number {
-    ($($t:ty),*) => {$(
-        impl __WkFromJs for $t {
-            fn from_js(v: &::wasm_bindgen::JsValue) -> ::std::option::Option<Self> {
-                let n = v
-                    .as_f64()
-                    .or_else(|| v.as_string().and_then(|s| s.trim().parse::<f64>().ok()))?;
-                n.is_finite().then(|| n as $t)
-            }
-        }
-    )*};
-}
-__wk_number!(f32, f64, i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
-"#;
 
 /// Nome do export wasm que recebe o valor novo de um `bind:` da página `main_name`.
 pub fn bind_fn_name(main_name: &str, id: usize) -> String {
@@ -231,6 +51,50 @@ pub fn transform(
     regions: &[Region],
     binds: &[Bind],
 ) -> Result<String> {
+    transform_impl(code, names, regions, binds, Mode::Page(main_name))
+}
+
+/// Traduz o script de um componente (`Nome.wk`): o módulo exporta `Props` e `__wk_create`.
+pub fn transform_component(
+    code: &str,
+    names: &BTreeSet<String>,
+    template: &Template,
+) -> Result<String> {
+    transform_impl(
+        code,
+        names,
+        &template.regions,
+        &template.binds,
+        Mode::Component(&template.parts),
+    )
+}
+
+/// Funções declaradas no nível superior de um script.
+pub fn fn_names(code: &str) -> Result<BTreeSet<String>> {
+    let stmts = Block::parse_within
+        .parse_str(code)
+        .map_err(|e| anyhow!("Rust inválido: {e}"))?;
+    Ok(stmts
+        .into_iter()
+        .filter_map(|s| match s {
+            Stmt::Item(Item::Fn(f)) => Some(f.sig.ident.to_string()),
+            _ => None,
+        })
+        .collect())
+}
+
+fn transform_impl(
+    code: &str,
+    names: &BTreeSet<String>,
+    regions: &[Region],
+    binds: &[Bind],
+    mode: Mode,
+) -> Result<String> {
+    let is_component = matches!(mode, Mode::Component(_));
+    let bind_name = |id: usize| match mode {
+        Mode::Page(main_name) => bind_fn_name(main_name, id),
+        Mode::Component(_) => format!("__wk_bind_{id}"),
+    };
     let stmts = Block::parse_within
         .parse_str(code)
         .map_err(|e| anyhow!("Rust inválido: {e}"))?;
@@ -243,6 +107,11 @@ pub fn transform(
             Stmt::Item(Item::Fn(f)) if names.contains(&f.sig.ident.to_string()) => {
                 if is_closurable(&f) {
                     exported.push(f);
+                } else if is_component {
+                    return Err(anyhow!(
+                        "`{}` é chamada por um atributo de evento e não pode ser genérica, `async` ou usar `self`",
+                        f.sig.ident
+                    ));
                 } else {
                     let mut f = f;
                     f.attrs
@@ -260,7 +129,7 @@ pub fn transform(
 
     // O sentido DOM → variável é uma função como as de handler: vira closure e dá flush.
     for bind in binds {
-        let name = format_ident!("{}", bind_fn_name(main_name, bind.id));
+        let name = format_ident!("{}", bind_name(bind.id));
         let target = &bind.target;
         exported.push(parse_quote! {
             pub fn #name(__v: ::wasm_bindgen::JsValue) {
@@ -269,6 +138,45 @@ pub fn transform(
                 }
             }
         });
+    }
+
+    // `let nome: T = prop!();` declara uma prop do componente.
+    let mut props: Vec<(syn::Ident, Type)> = Vec::new();
+    for stmt in body.iter_mut() {
+        let Stmt::Local(Local {
+            pat,
+            init: Some(init),
+            ..
+        }) = stmt
+        else {
+            continue;
+        };
+        if macro_named(&init.expr, "prop").is_none() {
+            continue;
+        }
+        if !is_component {
+            return Err(anyhow!("`prop!` só pode ser usado em componentes"));
+        }
+        let (Pat::Type(typed), true) = (&*pat, init.diverge.is_none()) else {
+            return Err(anyhow!("`prop!()` precisa de `let nome: Tipo = prop!();`"));
+        };
+        let Pat::Ident(PatIdent {
+            ident,
+            by_ref: None,
+            mutability: None,
+            subpat: None,
+            ..
+        }) = &*typed.pat
+        else {
+            return Err(anyhow!(
+                "props não podem ser `mut`: `let nome: Tipo = prop!();`"
+            ));
+        };
+        if !macro_named(&init.expr, "prop").unwrap().tokens.is_empty() {
+            return Err(anyhow!("`prop!()` não recebe argumentos"));
+        }
+        props.push((ident.clone(), (*typed.ty).clone()));
+        init.expr = Box::new(parse_quote!(__props.#ident));
     }
 
     // `let x = derived!(expr);` e `effect!(expr);` viram bindings reativas.
@@ -354,22 +262,41 @@ pub fn transform(
     }
 
     // Cada binding de região ou de `bind:` (variável → DOM) é um bloco que atualiza o DOM.
-    let mut updates: Vec<Block> = Vec::new();
-    for region in regions {
-        let (id, render) = (region.id, &region.render);
-        updates.push(parse_quote!({ __wk_set(#id, &#render); }));
-    }
-    for bind in binds {
-        let (id, prop, target) = (bind.id, &bind.prop, &bind.target);
-        updates.push(parse_quote!({
-            __wk_set_prop(#id, #prop, &::wasm_bindgen::JsValue::from((#target).clone()));
-        }));
-    }
-    let mut region_blocks: Vec<(Block, BTreeSet<String>)> = Vec::new();
-    for mut block in updates {
+    // Na página os ids são fixos; num componente são relativos a `__dom`, alocado por instância.
+    let dom_id = |id: usize| -> Expr {
+        match mode {
+            Mode::Page(_) => parse_quote!(#id),
+            Mode::Component(_) => parse_quote!(__dom + #id),
+        }
+    };
+    let rewritten = |mut block: Block| {
         let mut rewriter = Rewriter::new(candidates.clone(), &immutable);
         rewriter.visit_block_mut(&mut block);
-        region_blocks.push((block, rewriter.used));
+        (block, rewriter.used)
+    };
+    let mut region_blocks: Vec<(Block, BTreeSet<String>)> = Vec::new();
+    let mut comp_regions: Vec<(usize, Block, BTreeSet<String>)> = Vec::new();
+    let mut comp_binds: Vec<(usize, Block, BTreeSet<String>)> = Vec::new();
+    for region in regions {
+        let (id, render) = (region.id, &region.render);
+        if is_component {
+            let (block, used) = rewritten(render.clone());
+            comp_regions.push((id, block, used));
+        } else {
+            region_blocks.push(rewritten(parse_quote!({ __wk_set(#id, &#render); })));
+        }
+    }
+    for bind in binds {
+        let (prop, target) = (&bind.prop, &bind.target);
+        let dom = dom_id(bind.id);
+        let (block, used) = rewritten(parse_quote!({
+            __wk_set_prop(#dom, #prop, &::wasm_bindgen::JsValue::from(::std::clone::Clone::clone(&(#target))));
+        }));
+        if is_component {
+            comp_binds.push((bind.id, block, used));
+        } else {
+            region_blocks.push((block, used));
+        }
     }
 
     let mut derived_regs: BTreeMap<String, (Expr, BTreeSet<String>)> = BTreeMap::new();
@@ -402,6 +329,8 @@ pub fn transform(
     let promoted: BTreeSet<String> = used_by_fn
         .iter()
         .chain(region_blocks.iter().map(|(_, used)| used))
+        .chain(comp_regions.iter().map(|(_, _, used)| used))
+        .chain(comp_binds.iter().map(|(_, _, used)| used))
         .chain(derived_regs.values().map(|(_, used)| used))
         .chain(effect_regs.values().map(|(_, used)| used))
         .flatten()
@@ -410,6 +339,7 @@ pub fn transform(
         .collect();
     let has_dom = !regions.is_empty() || !binds.is_empty();
     let has_state = !promoted.is_empty() || has_dom || !effect_regs.is_empty();
+    let prop_names: BTreeSet<String> = props.iter().map(|(n, _)| n.to_string()).collect();
 
     let mut rewriter = Rewriter::new(promoted.clone(), &immutable);
     let mut main_stmts: Vec<Stmt> = Vec::new();
@@ -449,6 +379,10 @@ pub fn transform(
     let mut statics: Vec<TokenStream> = Vec::new();
     let mut wrappers: Vec<TokenStream> = Vec::new();
     for (f, used) in exported.iter().zip(&used_by_fn) {
+        if is_component {
+            registrations.push((after_decls(used), handler_registration(f, used)));
+            continue;
+        }
         let (registration, static_def, wrapper) = closure_parts(f, used, has_state);
         registrations.push((after_decls(used), registration));
         statics.push(static_def);
@@ -456,6 +390,14 @@ pub fn transform(
     }
     for (block, used) in &region_blocks {
         registrations.push((after_decls(used), region_binding(block, used)));
+    }
+    for (id, render, used) in &comp_regions {
+        for stmt in component_region(*id, render, used) {
+            registrations.push((after_decls(used), stmt));
+        }
+    }
+    for (id, update, used) in &comp_binds {
+        registrations.push((after_decls(used), component_bind(*id, update, used)));
     }
     registrations.sort_by_key(|(at, _)| *at);
 
@@ -472,37 +414,183 @@ pub fn transform(
         final_body.push(parse_quote!(__wk_flush();));
     }
 
-    let main_ident = format_ident!("{main_name}");
     let attr: TokenStream = WASM_BINDGEN_ATTR.parse().unwrap();
-    let state: TokenStream = if has_state {
-        RUNTIME_STATE.parse().unwrap()
-    } else {
-        quote!()
-    };
-    let region_rt: TokenStream = if regions.is_empty() {
-        quote!()
-    } else {
-        RUNTIME_REGIONS.parse().unwrap()
-    };
-    let bind_rt: TokenStream = if binds.is_empty() {
-        quote!()
-    } else {
-        RUNTIME_BINDS.parse().unwrap()
-    };
-    let tokens = quote! {
-        #state
-        #region_rt
-        #bind_rt
-        #(#hoisted)*
-        #(#statics)*
-        #(#wrappers)*
-        #attr
-        pub fn #main_ident() {
-            #(#final_body)*
+    let tokens = match mode {
+        Mode::Page(main_name) => {
+            let main_ident = format_ident!("{main_name}");
+            let reserve = if has_dom {
+                let n = regions.len().max(binds.len());
+                quote!(__wk_dom_reserve(#n);)
+            } else {
+                quote!()
+            };
+            quote! {
+                #[allow(unused_imports)]
+                use crate::__wk_rt::*;
+                #(#hoisted)*
+                #(#statics)*
+                #(#wrappers)*
+                #attr
+                pub fn #main_ident() {
+                    #reserve
+                    #(#final_body)*
+                }
+            }
+        }
+        Mode::Component(parts) => {
+            let (field, ty): (Vec<_>, Vec<_>) = props.iter().map(|(n, t)| (n, t)).unzip();
+            let n = regions.len().max(binds.len());
+            let html = component_html(parts, binds);
+            let updated: Vec<_> = props
+                .iter()
+                .filter(|(n, _)| promoted.contains(&n.to_string()))
+                .map(|(n, _)| n)
+                .collect();
+            let shared: BTreeSet<String> = updated.iter().map(|n| n.to_string()).collect();
+            let clones = clone_names(&shared);
+            let region_names: Vec<_> = (0..regions.len())
+                .map(|k| format_ident!("__r{k}"))
+                .collect();
+            let _ = prop_names;
+            quote! {
+                #[allow(unused_imports)]
+                use crate::__wk_rt::*;
+                #(#hoisted)*
+                pub struct Props {
+                    #(pub #field: #ty,)*
+                }
+                pub fn __wk_create(__props: Props) -> __WkInstance<Props> {
+                    let __inst = __wk_owner();
+                    let __dom = __wk_dom_alloc(#n);
+                    #(#final_body)*
+                    let __update: ::std::rc::Rc<dyn Fn(Props)> = {
+                        #(#clones)*
+                        ::std::rc::Rc::new(move |__p: Props| {
+                            #(__wk_set_derived(&#updated, __p.#updated);)*
+                        })
+                    };
+                    let __html: ::std::rc::Rc<dyn Fn() -> ::std::string::String> = {
+                        #(let #region_names = #region_names.clone();)*
+                        ::std::rc::Rc::new(move || {
+                            let mut __out = ::std::string::String::new();
+                            #html
+                            __out
+                        })
+                    };
+                    __WkInstance { update: __update, html: __html }
+                }
+            }
         }
     };
     let file = syn::parse2::<syn::File>(tokens).map_err(|e| anyhow!("erro interno: {e}"))?;
     Ok(prettyplease::unparse(&file))
+}
+
+/// Função chamada por atributos de evento de um componente: fica registrada na instância,
+/// que o HTML alcança por `__wk.c(id).nome(...)`.
+fn handler_registration(f: &ItemFn, used: &BTreeSet<String>) -> Stmt {
+    let name = f.sig.ident.to_string();
+    let block = &f.block;
+    let ret: Type = match &f.sig.output {
+        ReturnType::Default => parse_quote!(()),
+        ReturnType::Type(_, ty) => (**ty).clone(),
+    };
+    let (pats, tys): (Vec<_>, Vec<_>) = f
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|a| match a {
+            FnArg::Typed(t) => Some((&t.pat, &t.ty)),
+            FnArg::Receiver(_) => None,
+        })
+        .unzip();
+    let indexes = 0..pats.len();
+    let clones = clone_names(used);
+    parse_quote!({
+        #(#clones)*
+        let __f = move |#(#pats: #tys),*| -> #ret #block;
+        __wk_register(
+            __inst,
+            #name,
+            ::std::rc::Rc::new(move |__args: &[::wasm_bindgen::JsValue]| {
+                let _ = __f(#(__wk_arg(__args, #indexes)),*);
+            }),
+        );
+    })
+}
+
+/// Região de um componente: `__rN` gera o HTML (usado ao criar e ao reexibir a instância) e a
+/// binding o reaplica quando suas variáveis mudam.
+fn component_region(id: usize, render: &Block, used: &BTreeSet<String>) -> [Stmt; 2] {
+    let name = format_ident!("__r{id}");
+    let clones = clone_names(used);
+    let ids = used.iter().map(|v| format_ident!("{v}"));
+    [
+        parse_quote!(
+            let #name: ::std::rc::Rc<dyn Fn() -> ::std::string::String> = {
+                #(#clones)*
+                let __pool = __wk_pool();
+                ::std::rc::Rc::new(move || -> ::std::string::String #render)
+            };
+        ),
+        parse_quote!({
+            let __render = #name.clone();
+            __wk_bind_lazy(&[#(#ids.id()),*], move || __wk_set(__dom + #id, &__render()));
+        }),
+    ]
+}
+
+/// `bind:` de um componente: a variável → DOM roda quando ela muda e uma vez quando o DOM da
+/// instância é inserido (`__wk_init_N`, chamada pelo JS).
+fn component_bind(id: usize, update: &Block, used: &BTreeSet<String>) -> Stmt {
+    let clones = clone_names(used);
+    let ids: Vec<_> = used.iter().map(|v| format_ident!("{v}")).collect();
+    let init = format!("__wk_init_{id}");
+    parse_quote!({
+        let __deps = [#(#ids.id()),*];
+        #(#clones)*
+        let __update: ::std::rc::Rc<dyn Fn()> = ::std::rc::Rc::new(move || #update);
+        let __init = __update.clone();
+        __wk_register(
+            __inst,
+            #init,
+            ::std::rc::Rc::new(move |_: &[::wasm_bindgen::JsValue]| __init()),
+        );
+        __wk_bind_lazy(&__deps, move || __update());
+    })
+}
+
+/// Monta, em `__out`, o HTML de uma instância: texto estático, regiões e atributos de `bind:`.
+fn component_html(parts: &[Part], binds: &[Bind]) -> TokenStream {
+    let mut out = TokenStream::new();
+    for part in parts {
+        out.extend(match part {
+            Part::Text(text) => text_tokens(text),
+            Part::Region(id) => {
+                let name = format_ident!("__r{id}");
+                quote!(
+                    __out.push_str(&::std::format!("<!--wk:{}-->", __dom + #id));
+                    __out.push_str(&#name());
+                    __out.push_str(&::std::format!("<!--/wk:{}-->", __dom + #id));
+                )
+            }
+            Part::Bind(id) => {
+                let bind = &binds[*id];
+                let (prop, event) = (&bind.prop, &bind.event);
+                quote!(
+                    __out.push_str(&::std::format!(
+                        "data-wk-b{}=\"{}|{}|{}|{}\"",
+                        __dom + #id,
+                        __inst,
+                        #id,
+                        #prop,
+                        #event
+                    ));
+                )
+            }
+        });
+    }
+    out
 }
 
 /// Registro de uma região do template: renderiza agora e quando suas variáveis mudarem.
@@ -510,6 +598,7 @@ fn region_binding(block: &Block, used: &BTreeSet<String>) -> Stmt {
     let names: Vec<_> = used.iter().map(|v| format_ident!("{v}")).collect();
     parse_quote!({
         #(let #names = #names.clone();)*
+        let __pool = __wk_pool();
         __wk_bind(&[#(#names.id()),*], move || #block);
     })
 }
