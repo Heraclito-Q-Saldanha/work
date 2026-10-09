@@ -185,11 +185,17 @@ fn transform_impl(
                 ));
             }
             (true, false) => {
-                return Err(anyhow!("`bind!()` precisa de `let mut nome: Tipo = bind!();`"));
+                return Err(anyhow!(
+                    "`bind!()` precisa de `let mut nome: Tipo = bind!();`"
+                ));
             }
             _ => {}
         }
-        if !macro_named(&init.expr, macro_name).unwrap().tokens.is_empty() {
+        if !macro_named(&init.expr, macro_name)
+            .unwrap()
+            .tokens
+            .is_empty()
+        {
             return Err(anyhow!("`{macro_name}!()` não recebe argumentos"));
         }
         let ty = (*typed.ty).clone();
@@ -1298,7 +1304,13 @@ mod bind_tests {
     #[test]
     fn binding_a_non_state_variable_is_an_error() {
         let t = template::compile("{#each xs as x}<C bind:v={x} />{/each}").unwrap();
-        let err = transform("let xs = Vec::<i32>::new();", &BTreeSet::new(), "m", &t.regions, &t.binds);
+        let err = transform(
+            "let xs = Vec::<i32>::new();",
+            &BTreeSet::new(),
+            "m",
+            &t.regions,
+            &t.binds,
+        );
         assert!(err.is_err());
         let t = template::compile("<C bind:v={k} />").unwrap();
         let err = transform("let k = 1;", &BTreeSet::new(), "m", &t.regions, &t.binds);

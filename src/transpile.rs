@@ -11,7 +11,7 @@ use crate::{loader, parser, rust, script, template};
 
 const RUNTIME: &str = include_str!("runtime/wk_rt.rs");
 
-const IGNORED_DIRS: [&str; 3] = ["target", "dist", ".git"];
+pub const IGNORED_DIRS: [&str; 3] = ["target", "dist", ".git"];
 
 /// Página HTML gerada a partir de um `.wk`, com caminho relativo a `src/`.
 pub struct Page {

@@ -19,6 +19,19 @@ npx --yes @vscode/vsce package
 code --install-extension wk-syntax-0.2.0.vsix
 ```
 
+## Novo projeto
+
+```sh
+cargo wk new meu-app   # cria a pasta meu-app/
+cargo wk init             # cria o projeto na pasta atual, com o nome dela
+```
+
+## Desenvolvimento
+
+```sh
+cargo wk run [--port 8080]   # compila, serve dist/ e recompila a cada mudança
+```
+
 ## Exemples
 
 para rodar os exemplos, rode
