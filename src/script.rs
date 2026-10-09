@@ -109,7 +109,7 @@ fn transform_impl(
                     exported.push(f);
                 } else if is_component {
                     return Err(anyhow!(
-                        "`{}` é chamada por um atributo de evento e não pode ser genérica, `async` ou usar `self`",
+                        "`{}` é chamada por um atributo de evento e não pode ser genérica ou usar `self`",
                         f.sig.ident
                     ));
                 } else {
@@ -550,6 +550,23 @@ fn handler_registration(f: &ItemFn, used: &BTreeSet<String>) -> Stmt {
         .unzip();
     let indexes = 0..pats.len();
     let clones = clone_names(used);
+    if f.sig.asyncness.is_some() {
+        let inner = clone_names(used);
+        return parse_quote!({
+            #(#clones)*
+            let __f = move |#(#pats: #tys),*| -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = #ret>>> {
+                #(#inner)*
+                ::std::boxed::Box::pin(async move #block)
+            };
+            __wk_register(
+                __inst,
+                #name,
+                ::std::rc::Rc::new(move |__args: &[::wasm_bindgen::JsValue]| {
+                    ::wasm_bindgen_futures::spawn_local(__wk_flushing(__f(#(__wk_arg(__args, #indexes)),*)));
+                }),
+            );
+        });
+    }
     parse_quote!({
         #(#clones)*
         let __f = move |#(#pats: #tys),*| -> #ret #block;
@@ -716,10 +733,9 @@ fn effect_binding(expr: &Expr, used: &BTreeSet<String>) -> Stmt {
     })
 }
 
-/// Funções que podem virar closures: sem genéricos, `async` ou `self`.
+/// Funções que podem virar closures: sem genéricos ou `self`.
 fn is_closurable(f: &ItemFn) -> bool {
     f.sig.generics.params.is_empty()
-        && f.sig.asyncness.is_none()
         && f.sig.variadic.is_none()
         && f.sig.inputs.iter().all(|a| matches!(a, FnArg::Typed(_)))
 }
@@ -796,6 +812,15 @@ fn ident_of(pat: &Pat) -> syn::Ident {
     }
 }
 
+fn clones_of(used: &BTreeSet<String>) -> Vec<TokenStream> {
+    used.iter()
+        .map(|v| {
+            let v = format_ident!("{v}");
+            quote!(let #v = #v.clone();)
+        })
+        .collect()
+}
+
 /// Devolve (registro da closure, `thread_local!` que a guarda, wrapper exportado).
 fn closure_parts(
     f: &ItemFn,
@@ -820,10 +845,7 @@ fn closure_parts(
         })
         .unzip();
     let args: Vec<_> = (0..pats.len()).map(|i| format_ident!("__a{i}")).collect();
-    let clones = used.iter().map(|v| {
-        let v = format_ident!("{v}");
-        quote!(let #v = #v.clone();)
-    });
+    let clones = clones_of(used);
     let missing = format!("`{name}` chamada antes do script da página terminar de carregar");
     let attr: TokenStream = WASM_BINDGEN_ATTR.parse().unwrap();
     let flush = if flush {
@@ -831,6 +853,37 @@ fn closure_parts(
     } else {
         quote!()
     };
+
+    if f.sig.asyncness.is_some() {
+        // A closure devolve o futuro; o wrapper dá flush a cada vez que ele é consultado,
+        // para que o que mudou antes e depois de cada `.await` apareça na tela.
+        let fut: Type = parse_quote!(::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = #ret>>>);
+        let inner = clones_of(used);
+        let registration = parse_quote!({
+            #(#clones)*
+            let __wk_f: ::std::boxed::Box<dyn Fn(#(#tys),*) -> #fut> =
+                ::std::boxed::Box::new(move |#(#pats: #tys),*| -> #fut {
+                    #(#inner)*
+                    ::std::boxed::Box::pin(async move #block)
+                });
+            #storage.with(|s| *s.borrow_mut() = Some(__wk_f));
+        });
+        let static_def = quote! {
+            thread_local! {
+                static #storage: ::std::cell::RefCell<Option<::std::boxed::Box<dyn Fn(#(#tys),*) -> #fut>>> =
+                    ::std::cell::RefCell::new(None);
+            }
+        };
+        let wrapper = quote! {
+            #(#attrs)*
+            #attr
+            pub async fn #name(#(#args: #tys),*) -> #ret {
+                let __wk_future = #storage.with(|f| (f.borrow().as_ref().expect(#missing))(#(#args),*));
+                __wk_flushing(__wk_future).await
+            }
+        };
+        return (registration, static_def, wrapper);
+    }
 
     let registration = parse_quote!({
         #(#clones)*
@@ -1315,5 +1368,42 @@ mod bind_tests {
         let t = template::compile("<C bind:v={k} />").unwrap();
         let err = transform("let k = 1;", &BTreeSet::new(), "m", &t.regions, &t.binds);
         assert!(err.unwrap_err().to_string().contains("let mut"));
+    }
+}
+
+#[cfg(test)]
+mod async_tests {
+    use super::*;
+    use crate::template;
+
+    #[test]
+    fn async_page_functions_flush_while_running() {
+        let names = ["go".to_string()].into();
+        let out = transform(
+            "let mut n = 0;\npub async fn go() { n += 1; }",
+            &names,
+            "m",
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(out.contains("pub async fn go()"));
+        assert!(out.contains("__wk_flushing"));
+        assert!(out.contains("(*n.get_mut()) += 1;"));
+    }
+
+    #[test]
+    fn async_component_handlers_are_spawned() {
+        let names = ["go".to_string()].into();
+        let t = template::compile_with(
+            "<button onclick=\"go()\">{n}</button>",
+            &template::Options {
+                component_handlers: Some(&names),
+            },
+        )
+        .unwrap();
+        let out = transform_component("let mut n = 0;\npub async fn go() { n += 1; }", &names, &t)
+            .unwrap();
+        assert!(out.contains("spawn_local"));
     }
 }

@@ -366,3 +366,23 @@ pub fn __wk_init(instance: usize, name: &str) {
         handler(&[]);
     }
 }
+
+/// Envolve o futuro de uma função `async` e dá flush depois de cada consulta, para que as
+/// alterações feitas antes e depois de cada `.await` apareçam na tela.
+pub fn __wk_flushing<F: ::std::future::Future>(
+    future: F,
+) -> impl ::std::future::Future<Output = F::Output> {
+    struct Flushing<F>(::std::pin::Pin<Box<F>>);
+    impl<F: ::std::future::Future> ::std::future::Future for Flushing<F> {
+        type Output = F::Output;
+        fn poll(
+            mut self: ::std::pin::Pin<&mut Self>,
+            cx: &mut ::std::task::Context<'_>,
+        ) -> ::std::task::Poll<F::Output> {
+            let result = self.0.as_mut().poll(cx);
+            __wk_flush();
+            result
+        }
+    }
+    Flushing(Box::pin(future))
+}

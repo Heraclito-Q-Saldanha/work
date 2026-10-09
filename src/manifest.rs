@@ -17,23 +17,46 @@ pub fn lib_name(root: &Path) -> Result<String> {
 }
 
 /// Garante que o projeto em `project` depende de `wasm-bindgen` na versão do CLI embutido.
+/// Também adiciona `wasm-bindgen-futures` quando o código gerado usa `async`.
 pub fn ensure_wasm_bindgen(project: &Path) -> Result<()> {
+    ensure_dependency(
+        project,
+        "wasm-bindgen",
+        &format!("wasm-bindgen@={WASM_BINDGEN_VERSION}"),
+    )?;
+    if uses_async(project) {
+        ensure_dependency(project, "wasm-bindgen-futures", "wasm-bindgen-futures")?;
+    }
+    Ok(())
+}
+
+fn ensure_dependency(project: &Path, name: &str, spec: &str) -> Result<()> {
     let manifest = read(project)?;
     if manifest
         .get("dependencies")
-        .is_some_and(|d| d.get("wasm-bindgen").is_some())
+        .is_some_and(|d| d.get(name).is_some())
     {
         return Ok(());
     }
     let status = Command::new("cargo")
-        .args(["add", &format!("wasm-bindgen@={WASM_BINDGEN_VERSION}")])
+        .args(["add", spec])
         .current_dir(project)
         .status()
         .context("executando cargo add")?;
     if !status.success() {
-        bail!("não foi possível adicionar wasm-bindgen ao projeto");
+        bail!("não foi possível adicionar {name} ao projeto");
     }
     Ok(())
+}
+
+fn uses_async(project: &Path) -> bool {
+    walkdir::WalkDir::new(project.join("src"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+        .filter(|e| e.file_name() != "__wk_rt.rs")
+        .filter_map(|e| fs::read_to_string(e.path()).ok())
+        .any(|code| code.contains("async"))
 }
 
 fn read(dir: &Path) -> Result<toml::Table> {
