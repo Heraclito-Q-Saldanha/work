@@ -1,16 +1,23 @@
 <script lang="rs">
 	let label: String = prop!();
+	let mut count_global: i32 = bind!();
+	
 	let mut count = 0;
 	let mut note = String::new();
 
 	pub fn inc() {
 		count += 1;
 	}
+
+	pub fn inc_global() {
+		count_global += 1;
+	}
 </script>
 
 <div>
 	<strong>{label}</strong>: {count}
 	<button onclick="inc()">+1</button>
+	<button onclick="inc_global()">+1 global</button>
 	<input bind:value={note} placeholder="note">
 	<em>{note}</em>
 </div>

@@ -140,8 +140,10 @@ fn transform_impl(
         });
     }
 
-    // `let nome: T = prop!();` declara uma prop do componente.
+    // `let nome: T = prop!();` declara uma prop do componente; `let mut nome: T = bind!();`
+    // uma prop com ligação de mão dupla, que compartilha a variável do pai.
     let mut props: Vec<(syn::Ident, Type)> = Vec::new();
+    let mut bound_props: BTreeSet<String> = BTreeSet::new();
     for stmt in body.iter_mut() {
         let Stmt::Local(Local {
             pat,
@@ -151,31 +153,52 @@ fn transform_impl(
         else {
             continue;
         };
-        if macro_named(&init.expr, "prop").is_none() {
+        let macro_name = ["prop", "bind"]
+            .into_iter()
+            .find(|n| macro_named(&init.expr, n).is_some());
+        let Some(macro_name) = macro_name else {
             continue;
-        }
+        };
+        let is_bind = macro_name == "bind";
         if !is_component {
-            return Err(anyhow!("`prop!` só pode ser usado em componentes"));
+            return Err(anyhow!("`{macro_name}!` só pode ser usado em componentes"));
         }
         let (Pat::Type(typed), true) = (&*pat, init.diverge.is_none()) else {
-            return Err(anyhow!("`prop!()` precisa de `let nome: Tipo = prop!();`"));
+            return Err(anyhow!(
+                "`{macro_name}!()` precisa de `let nome: Tipo = {macro_name}!();`"
+            ));
         };
         let Pat::Ident(PatIdent {
             ident,
             by_ref: None,
-            mutability: None,
+            mutability,
             subpat: None,
             ..
         }) = &*typed.pat
         else {
-            return Err(anyhow!(
-                "props não podem ser `mut`: `let nome: Tipo = prop!();`"
-            ));
+            return Err(anyhow!("`{macro_name}!()` precisa de um nome simples"));
         };
-        if !macro_named(&init.expr, "prop").unwrap().tokens.is_empty() {
-            return Err(anyhow!("`prop!()` não recebe argumentos"));
+        match (is_bind, mutability.is_some()) {
+            (false, true) => {
+                return Err(anyhow!(
+                    "props não podem ser `mut`: `let nome: Tipo = prop!();` (use `bind!()` para mutar)"
+                ));
+            }
+            (true, false) => {
+                return Err(anyhow!("`bind!()` precisa de `let mut nome: Tipo = bind!();`"));
+            }
+            _ => {}
         }
-        props.push((ident.clone(), (*typed.ty).clone()));
+        if !macro_named(&init.expr, macro_name).unwrap().tokens.is_empty() {
+            return Err(anyhow!("`{macro_name}!()` não recebe argumentos"));
+        }
+        let ty = (*typed.ty).clone();
+        if is_bind {
+            bound_props.insert(ident.to_string());
+            props.push((ident.clone(), parse_quote!(__WkShared<#ty>)));
+        } else {
+            props.push((ident.clone(), ty));
+        }
         init.expr = Box::new(parse_quote!(__props.#ident));
     }
 
@@ -269,19 +292,27 @@ fn transform_impl(
             Mode::Component(_) => parse_quote!(__dom + #id),
         }
     };
+    // `used` são as variáveis capturadas pelo bloco; `deps` só as que ele lê (as passadas a
+    // `bind:` num componente filho não o fazem reexecutar).
+    let bind_error: std::cell::RefCell<Option<String>> = Default::default();
     let rewritten = |mut block: Block| {
         let mut rewriter = Rewriter::new(candidates.clone(), &immutable);
         rewriter.visit_block_mut(&mut block);
-        (block, rewriter.used)
+        if let Some(e) = rewriter.error.take() {
+            bind_error.borrow_mut().get_or_insert(e);
+        }
+        let deps = rewriter.used.clone();
+        let used = deps.union(&rewriter.bound).cloned().collect();
+        (block, used, deps)
     };
-    let mut region_blocks: Vec<(Block, BTreeSet<String>)> = Vec::new();
-    let mut comp_regions: Vec<(usize, Block, BTreeSet<String>)> = Vec::new();
-    let mut comp_binds: Vec<(usize, Block, BTreeSet<String>)> = Vec::new();
+    let mut region_blocks: Vec<RegionBlock> = Vec::new();
+    let mut comp_regions: Vec<(usize, Block, BTreeSet<String>, BTreeSet<String>)> = Vec::new();
+    let mut comp_binds: Vec<(usize, Block, BTreeSet<String>, BTreeSet<String>)> = Vec::new();
     for region in regions {
         let (id, render) = (region.id, &region.render);
         if is_component {
-            let (block, used) = rewritten(render.clone());
-            comp_regions.push((id, block, used));
+            let (block, used, deps) = rewritten(render.clone());
+            comp_regions.push((id, block, used, deps));
         } else {
             region_blocks.push(rewritten(parse_quote!({ __wk_set(#id, &#render); })));
         }
@@ -289,13 +320,13 @@ fn transform_impl(
     for bind in binds {
         let (prop, target) = (&bind.prop, &bind.target);
         let dom = dom_id(bind.id);
-        let (block, used) = rewritten(parse_quote!({
+        let (block, used, deps) = rewritten(parse_quote!({
             __wk_set_prop(#dom, #prop, &::wasm_bindgen::JsValue::from(::std::clone::Clone::clone(&(#target))));
         }));
         if is_component {
-            comp_binds.push((bind.id, block, used));
+            comp_binds.push((bind.id, block, used, deps));
         } else {
-            region_blocks.push((block, used));
+            region_blocks.push((block, used, deps));
         }
     }
 
@@ -326,15 +357,20 @@ fn transform_impl(
         effect_regs.insert(*i, (expr, rewriter.used));
     }
 
+    if let Some(e) = bind_error.into_inner() {
+        return Err(anyhow!(e));
+    }
+
     let promoted: BTreeSet<String> = used_by_fn
         .iter()
-        .chain(region_blocks.iter().map(|(_, used)| used))
-        .chain(comp_regions.iter().map(|(_, _, used)| used))
-        .chain(comp_binds.iter().map(|(_, _, used)| used))
+        .chain(region_blocks.iter().map(|(_, used, _)| used))
+        .chain(comp_regions.iter().map(|(_, _, used, _)| used))
+        .chain(comp_binds.iter().map(|(_, _, used, _)| used))
         .chain(derived_regs.values().map(|(_, used)| used))
         .chain(effect_regs.values().map(|(_, used)| used))
         .flatten()
         .chain(&derived_names)
+        .chain(&bound_props)
         .cloned()
         .collect();
     let has_dom = !regions.is_empty() || !binds.is_empty();
@@ -356,7 +392,7 @@ fn transform_impl(
         }
         match simple_decl(&stmt).filter(|n| promoted.contains(n)) {
             Some(name) => {
-                stmt = share_declaration(stmt, &mut rewriter);
+                stmt = share_declaration(stmt, &mut rewriter, bound_props.contains(&name));
                 let end = main_stmts.len() + 1;
                 decl_end.insert(name.clone(), end);
                 if let Some((expr, used)) = derived_regs.get(&name) {
@@ -388,16 +424,16 @@ fn transform_impl(
         statics.push(static_def);
         wrappers.push(wrapper);
     }
-    for (block, used) in &region_blocks {
-        registrations.push((after_decls(used), region_binding(block, used)));
+    for (block, used, deps) in &region_blocks {
+        registrations.push((after_decls(used), region_binding(block, used, deps)));
     }
-    for (id, render, used) in &comp_regions {
-        for stmt in component_region(*id, render, used) {
+    for (id, render, used, deps) in &comp_regions {
+        for stmt in component_region(*id, render, used, deps) {
             registrations.push((after_decls(used), stmt));
         }
     }
-    for (id, update, used) in &comp_binds {
-        registrations.push((after_decls(used), component_bind(*id, update, used)));
+    for (id, update, used, deps) in &comp_binds {
+        registrations.push((after_decls(used), component_bind(*id, update, used, deps)));
     }
     registrations.sort_by_key(|(at, _)| *at);
 
@@ -443,7 +479,9 @@ fn transform_impl(
             let html = component_html(parts, binds);
             let updated: Vec<_> = props
                 .iter()
-                .filter(|(n, _)| promoted.contains(&n.to_string()))
+                .filter(|(n, _)| {
+                    promoted.contains(&n.to_string()) && !bound_props.contains(&n.to_string())
+                })
                 .map(|(n, _)| n)
                 .collect();
             let shared: BTreeSet<String> = updated.iter().map(|n| n.to_string()).collect();
@@ -521,10 +559,15 @@ fn handler_registration(f: &ItemFn, used: &BTreeSet<String>) -> Stmt {
 
 /// Região de um componente: `__rN` gera o HTML (usado ao criar e ao reexibir a instância) e a
 /// binding o reaplica quando suas variáveis mudam.
-fn component_region(id: usize, render: &Block, used: &BTreeSet<String>) -> [Stmt; 2] {
+fn component_region(
+    id: usize,
+    render: &Block,
+    used: &BTreeSet<String>,
+    deps: &BTreeSet<String>,
+) -> [Stmt; 2] {
     let name = format_ident!("__r{id}");
     let clones = clone_names(used);
-    let ids = used.iter().map(|v| format_ident!("{v}"));
+    let ids = deps.iter().map(|v| format_ident!("{v}"));
     [
         parse_quote!(
             let #name: ::std::rc::Rc<dyn Fn() -> ::std::string::String> = {
@@ -542,9 +585,14 @@ fn component_region(id: usize, render: &Block, used: &BTreeSet<String>) -> [Stmt
 
 /// `bind:` de um componente: a variável → DOM roda quando ela muda e uma vez quando o DOM da
 /// instância é inserido (`__wk_init_N`, chamada pelo JS).
-fn component_bind(id: usize, update: &Block, used: &BTreeSet<String>) -> Stmt {
+fn component_bind(
+    id: usize,
+    update: &Block,
+    used: &BTreeSet<String>,
+    deps: &BTreeSet<String>,
+) -> Stmt {
     let clones = clone_names(used);
-    let ids: Vec<_> = used.iter().map(|v| format_ident!("{v}")).collect();
+    let ids: Vec<_> = deps.iter().map(|v| format_ident!("{v}")).collect();
     let init = format!("__wk_init_{id}");
     parse_quote!({
         let __deps = [#(#ids.id()),*];
@@ -594,14 +642,18 @@ fn component_html(parts: &[Part], binds: &[Bind]) -> TokenStream {
 }
 
 /// Registro de uma região do template: renderiza agora e quando suas variáveis mudarem.
-fn region_binding(block: &Block, used: &BTreeSet<String>) -> Stmt {
+fn region_binding(block: &Block, used: &BTreeSet<String>, deps: &BTreeSet<String>) -> Stmt {
     let names: Vec<_> = used.iter().map(|v| format_ident!("{v}")).collect();
+    let ids: Vec<_> = deps.iter().map(|v| format_ident!("{v}")).collect();
     parse_quote!({
+        let __deps = [#(#ids.id()),*];
         #(let #names = #names.clone();)*
         let __pool = __wk_pool();
-        __wk_bind(&[#(#names.id()),*], move || #block);
+        __wk_bind(&__deps, move || #block);
     })
 }
+
+type RegionBlock = (Block, BTreeSet<String>, BTreeSet<String>);
 
 fn macro_named<'a>(expr: &'a Expr, name: &str) -> Option<&'a Macro> {
     match expr {
@@ -701,7 +753,7 @@ fn simple_decl(stmt: &Stmt) -> Option<String> {
 }
 
 /// `let mut x: T = init;` vira `let x: __WkShared<T> = __WkShared::new(init);`.
-fn share_declaration(stmt: Stmt, rewriter: &mut Rewriter) -> Stmt {
+fn share_declaration(stmt: Stmt, rewriter: &mut Rewriter, bound: bool) -> Stmt {
     let Stmt::Local(Local {
         pat,
         init: Some(mut init),
@@ -712,6 +764,13 @@ fn share_declaration(stmt: Stmt, rewriter: &mut Rewriter) -> Stmt {
     };
     rewriter.visit_expr_mut(&mut init.expr);
     let value = &init.expr;
+    if bound {
+        let (name, ty) = match &pat {
+            Pat::Type(t) => (ident_of(&t.pat), &t.ty),
+            _ => unreachable!("`bind!()` exige o tipo"),
+        };
+        return parse_quote!(let #name: __WkShared<#ty> = #value;);
+    }
     match pat {
         Pat::Type(t) => {
             let (name, ty) = (ident_of(&t.pat), &t.ty);
@@ -811,6 +870,9 @@ struct Rewriter {
     /// Variáveis declaradas sem `mut`: nunca passam por `get_mut`.
     immutable: BTreeSet<String>,
     used: BTreeSet<String>,
+    /// Variáveis passadas por `bind:name={x}` a um componente: capturadas, mas não lidas.
+    bound: BTreeSet<String>,
+    error: Option<String>,
     /// A expressão visitada é um lugar que pode ser escrito (lado esquerdo de `=`, `&mut`, receptor de método).
     mutable: bool,
 }
@@ -868,6 +930,8 @@ impl Rewriter {
             active,
             immutable: immutable.clone(),
             used: BTreeSet::new(),
+            bound: BTreeSet::new(),
+            error: None,
             mutable: false,
         }
     }
@@ -893,6 +957,22 @@ impl Rewriter {
 impl VisitMut for Rewriter {
     fn visit_expr_mut(&mut self, e: &mut Expr) {
         let mutable = std::mem::replace(&mut self.mutable, false);
+        if let Expr::Macro(m) = e
+            && m.mac.path.is_ident("__wk_bind")
+        {
+            let name = m.mac.tokens.to_string();
+            if !self.active.contains(&name) {
+                self.error = Some(format!(
+                    "`bind:` precisa de uma variável `let mut` do script, não `{name}`"
+                ));
+            } else if self.immutable.contains(&name) {
+                self.error = Some(format!("`bind:` exige que `{name}` seja `let mut`"));
+            }
+            let id = format_ident!("{name}");
+            self.bound.insert(name);
+            *e = parse_quote!(#id.clone());
+            return;
+        }
         match e {
             Expr::Path(p)
                 if p.qself.is_none()
@@ -1121,8 +1201,8 @@ mod tests {
             "<p>{n}</p>{#each [1, 2].iter() as x}{x}{/each}",
         );
         let flat: String = out.split_whitespace().collect();
-        assert!(flat.contains("&[n.id()]"));
-        assert!(flat.contains("&[],"));
+        assert!(flat.contains("[n.id()]"));
+        assert!(flat.contains("[]"));
         assert!(flat.contains("__wk_set(0usize"));
         assert!(flat.contains("__wk_set(1usize"));
         assert!(out.contains("let other = 1;"));
@@ -1188,5 +1268,40 @@ mod immutability_tests {
     fn writing_an_immutable_variable_is_left_to_rustc_to_reject() {
         let out = run("let n = 1; pub fn f() { n += 1; }");
         assert!(out.contains("(*n.get_ref()) += 1"));
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+    use crate::template;
+
+    fn component(code: &str) -> Result<String> {
+        let t = template::compile("<p>{n}</p>").unwrap();
+        transform_component(code, &BTreeSet::new(), &t)
+    }
+
+    #[test]
+    fn bind_prop_shares_the_parents_state() {
+        let out = component("let mut n: i32 = bind!();").unwrap();
+        assert!(out.contains("pub n: __WkShared<i32>"));
+        assert!(out.contains("let n: __WkShared<i32> = __props.n;"));
+        assert!(!out.contains("__wk_set_derived(&n"));
+    }
+
+    #[test]
+    fn bind_requires_mut_and_prop_forbids_it() {
+        assert!(component("let n: i32 = bind!();").is_err());
+        assert!(component("let mut n: i32 = prop!();").is_err());
+    }
+
+    #[test]
+    fn binding_a_non_state_variable_is_an_error() {
+        let t = template::compile("{#each xs as x}<C bind:v={x} />{/each}").unwrap();
+        let err = transform("let xs = Vec::<i32>::new();", &BTreeSet::new(), "m", &t.regions, &t.binds);
+        assert!(err.is_err());
+        let t = template::compile("<C bind:v={k} />").unwrap();
+        let err = transform("let k = 1;", &BTreeSet::new(), "m", &t.regions, &t.binds);
+        assert!(err.unwrap_err().to_string().contains("let mut"));
     }
 }

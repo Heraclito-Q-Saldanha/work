@@ -45,10 +45,10 @@
 
 <h2>Counters</h2>
 
-<Counter label="fixed" />
+<Counter label="fixed" bind:count_global={clicks} />
 
 {#each items as item, i by i}
-	<Counter label={item} />
+	<Counter label={item} bind:count_global={clicks} />
 {/each}
 
 

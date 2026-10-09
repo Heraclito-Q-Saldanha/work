@@ -588,16 +588,25 @@ impl Lexer {
                     while self
                         .chars
                         .get(self.pos)
-                        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
                     {
                         self.pos += 1;
                     }
                     let name: String = self.chars[name_start..self.pos].iter().collect();
+                    let is_bind = name.starts_with("bind:");
+                    let name = name.strip_prefix("bind:").unwrap_or(&name).to_string();
+                    if is_bind && self.chars.get(self.pos) != Some(&'=') {
+                        props.push((name.clone(), format!("__wk_bind!({name})")));
+                        continue;
+                    }
                     if name.is_empty() || self.chars.get(self.pos) != Some(&'=') {
                         bail!("em `<{path}`: esperado `nome={{expr}}` ou `nome=\"texto\"`");
                     }
                     self.pos += 1;
                     let value = match self.chars.get(self.pos) {
+                        Some('{') if is_bind => {
+                            format!("__wk_bind!({})", self.read_braced()?.trim())
+                        }
                         Some('{') => clone_of(self.read_braced()?.trim()),
                         Some(q @ ('"' | '\'')) => {
                             let q = *q;
