@@ -46,3 +46,5 @@
 		<li>{i + 1}. {item}</li>
 	{/each}
 </ul>
+
+<a href="/about">About</a>

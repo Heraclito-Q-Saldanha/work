@@ -64,7 +64,7 @@ fn expand(out: PathBuf) -> Result<()> {
     let name = manifest::lib_name(&root)?;
     let pages = transpile::transpile_project(&root, &out, &name)?;
     for page in &pages {
-        std::fs::write(out.join("src").join(&page.path), &page.html)?;
+        std::fs::write(out.join("src/routes").join(&page.path), &page.html)?;
     }
     println!("projeto transpilado em {}", out.display());
     Ok(())

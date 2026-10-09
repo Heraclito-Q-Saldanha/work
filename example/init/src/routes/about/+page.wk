@@ -1,0 +1,9 @@
+<script lang="rs">
+	let mut n = 0;
+	pub fn more() {
+		n += 1;
+	}
+</script>
+
+<h1>About</h1>
+<button onclick="more()">more</button> {n}

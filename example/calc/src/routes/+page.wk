@@ -1,6 +1,14 @@
 <script lang="rs">
+	use crate::util;
+
 	let mut first = 0;
 	let mut second = 0;
+
+	effect!(|| {
+		if first + second > 10 {
+			util::alert("A soma é maior que 10");
+		}
+	});
 </script>
 
 <h1>Calculadora</h1>
